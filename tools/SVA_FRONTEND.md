@@ -16,6 +16,7 @@ support in the current OSS CAD `yosys-slang` + `sby` flow.
 - chained bounded-repeat consequents such as `A |-> B[*M:N] ##K C`
 - depth-bounded goto repetition consequents such as `A |-> B[->N] ##K C`
 - depth-bounded nonconsecutive repetition consequents such as `A |-> B[=N] ##K C`
+- event functions in terms such as `$rose(a)`, `$fell(b)`, `$stable(c)`, and `$changed(d)`
 - optional `disable iff (expr)`
 - `assert property (NAME);`
 - `assume property (NAME);`

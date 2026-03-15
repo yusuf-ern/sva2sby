@@ -88,6 +88,8 @@ REPETITION_RE = re.compile(
     re.DOTALL | re.VERBOSE,
 )
 
+EVENT_FUNCTION_NAMES = ("$rose", "$fell", "$stable", "$changed")
+
 
 @dataclass
 class FixedSequence:
@@ -111,6 +113,7 @@ class TermToken:
     repeat_min: int = 1
     repeat_max: int = 1
     repeat_kind: str = "consecutive"
+    sample_reg: str | None = None
 
 
 @dataclass
@@ -133,7 +136,7 @@ class EventualChainSequence:
 @dataclass
 class PathMatch:
     start_offset: int
-    samples: list[tuple[int, str]]
+    samples: list[tuple[int, TermToken]]
 
 
 @dataclass
@@ -334,6 +337,137 @@ def split_top_level(expr: str, token: str) -> list[str]:
     return parts
 
 
+def find_matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ValueError(f"Unbalanced parentheses in expression '{text.strip()}'")
+
+
+def normalize_event_function(name: str, argument: str) -> str:
+    arg = strip_wrapping_parens(argument)
+    wrapped = f"({arg})"
+    past = f"$past(({arg}))"
+    if name == "$rose":
+        return f"({wrapped} && !({past}))"
+    if name == "$fell":
+        return f"(!({wrapped}) && ({past}))"
+    if name == "$stable":
+        return f"({wrapped} == ({past}))"
+    if name == "$changed":
+        return f"({wrapped} != ({past}))"
+    raise ValueError(f"Unsupported event function '{name}'")
+
+
+def normalize_event_functions(expr: str) -> str:
+    parts: list[str] = []
+    index = 0
+    while index < len(expr):
+        matched = False
+        for name in EVENT_FUNCTION_NAMES:
+            if not expr.startswith(name, index):
+                continue
+            cursor = index + len(name)
+            while cursor < len(expr) and expr[cursor].isspace():
+                cursor += 1
+            if cursor >= len(expr) or expr[cursor] != "(":
+                continue
+            close = find_matching_paren(expr, cursor)
+            argument = normalize_event_functions(expr[cursor + 1 : close])
+            parts.append(normalize_event_function(name, argument))
+            index = close + 1
+            matched = True
+            break
+        if matched:
+            continue
+        parts.append(expr[index])
+        index += 1
+    return "".join(parts)
+
+
+def needs_sample_alias(expr: str) -> bool:
+    return "$past(" in expr
+
+
+@dataclass(frozen=True)
+class SampledExprRef:
+    expr: str
+    sample_reg: str | None = None
+
+
+def materialize_fixed_sequence(
+    seq: FixedSequence,
+    prefix: str,
+) -> tuple[list[SampledExprRef], list[str], list[str], list[str]]:
+    declarations: list[str] = []
+    clears: list[str] = []
+    updates: list[str] = []
+    refs: list[SampledExprRef] = []
+    for index, term in enumerate(seq.terms):
+        if needs_sample_alias(term):
+            sample_reg = f"{prefix}_s{index}"
+            declarations.append(declare_history_reg(sample_reg, 1))
+            clears.append(f"\t\t\t{sample_reg} <= 1'b0;\n")
+            updates.append(shift_assignment(sample_reg, 1, term))
+            refs.append(SampledExprRef(term, sample_reg))
+        else:
+            refs.append(SampledExprRef(term))
+    return refs, declarations, clears, updates
+
+
+def materialize_pattern_sequence(
+    pattern: PatternSequence,
+    prefix: str,
+) -> tuple[PatternSequence, list[str], list[str], list[str]]:
+    declarations: list[str] = []
+    clears: list[str] = []
+    updates: list[str] = []
+    terms: list[TermToken] = []
+    for index, term in enumerate(pattern.terms):
+        sample_reg = term.sample_reg
+        if needs_sample_alias(term.expr):
+            sample_reg = f"{prefix}_s{index}"
+            declarations.append(declare_history_reg(sample_reg, 1))
+            clears.append(f"\t\t\t{sample_reg} <= 1'b0;\n")
+            updates.append(shift_assignment(sample_reg, 1, term.expr))
+        terms.append(
+            TermToken(
+                expr=term.expr,
+                repeat_min=term.repeat_min,
+                repeat_max=term.repeat_max,
+                repeat_kind=term.repeat_kind,
+                sample_reg=sample_reg,
+            )
+        )
+    return PatternSequence(terms=terms, delays=list(pattern.delays)), declarations, clears, updates
+
+
+def sampled_expr_at_age(ref: SampledExprRef, age: int) -> str:
+    if age == 0:
+        return f"({ref.expr})"
+    if ref.sample_reg is not None:
+        if age == 1:
+            return ref.sample_reg
+        return past_expr(ref.sample_reg, age - 1)
+    return past_expr(ref.expr, age)
+
+
+def token_sample_expr_at_age(token: TermToken, age: int) -> str:
+    if age == 0:
+        return f"({token.expr})"
+    if token.sample_reg is not None:
+        if age == 1:
+            return token.sample_reg
+        return past_expr(token.sample_reg, age - 1)
+    return past_expr(token.expr, age)
+
+
 def parse_delay_token(expr: str, index: int) -> tuple[DelayRange, int] | None:
     if not expr.startswith("##", index):
         return None
@@ -478,12 +612,12 @@ def parse_term_token(expr: str) -> TermToken:
             "=": "nonconsecutive",
         }[op]
         return TermToken(
-            expr=strip_wrapping_parens(repeat_match.group("expr")),
+            expr=normalize_event_functions(strip_wrapping_parens(repeat_match.group("expr"))),
             repeat_min=repeat_min,
             repeat_max=repeat_max,
             repeat_kind=repeat_kind,
         )
-    return TermToken(expr=strip_wrapping_parens(expr))
+    return TermToken(expr=normalize_event_functions(strip_wrapping_parens(expr)))
 
 
 def concat_pattern_sequence(
@@ -566,13 +700,15 @@ def parse_sequence_expr(
     if len(plus_parts) > 1:
         if any(not part for part in plus_parts):
             raise ValueError(f"Malformed ##[+] chain '{expr.strip()}'")
-        return EventualChainSequence([strip_wrapping_parens(part) for part in plus_parts])
+        return EventualChainSequence(
+            [normalize_event_functions(strip_wrapping_parens(part)) for part in plus_parts]
+        )
 
     hold_match = FIXED_HOLD_RE.fullmatch(stripped)
     if hold_match:
         return UntilSequence(
-            hold_expr=strip_wrapping_parens(hold_match.group("hold")),
-            finish_expr=strip_wrapping_parens(hold_match.group("finish")),
+            hold_expr=normalize_event_functions(strip_wrapping_parens(hold_match.group("hold"))),
+            finish_expr=normalize_event_functions(strip_wrapping_parens(hold_match.group("finish"))),
         )
 
     pattern = parse_pattern_sequence(stripped, sequence_defs, active)
@@ -623,7 +759,11 @@ def parse_property(
     match = PROPERTY_BODY_RE.fullmatch(body.strip())
     if match:
         clock = match.group("clock").strip()
-        disable = match.group("disable").strip() if match.group("disable") else default_disable
+        disable = (
+            normalize_event_functions(match.group("disable").strip())
+            if match.group("disable")
+            else default_disable
+        )
         expr = match.group("expr")
         return parse_property_expr(name, expr, sequence_defs, clock, disable)
 
@@ -832,30 +972,78 @@ def assign_vector(name: str, bits: list[str]) -> str:
 
 
 def compile_fixed_sequence(seq: FixedSequence, prefix: str) -> SequenceLogic:
-    declarations: list[str] = []
-    clears: list[str] = []
-    updates: list[str] = []
+    term_refs, sample_declarations, sample_clears, sample_updates = materialize_fixed_sequence(
+        seq, prefix
+    )
+    declarations: list[str] = list(sample_declarations)
+    clears: list[str] = list(sample_clears)
+    updates: list[str] = list(sample_updates)
     invariants: list[str] = []
     match_terms: list[str] = []
     max_past_depth = 0
 
-    for index, term in enumerate(seq.terms):
+    for index, term_ref in enumerate(term_refs):
         delay_to_end = sum(seq.delays[index:]) if index < len(seq.delays) else 0
         if delay_to_end == 0:
-            match_terms.append(f"({term})")
+            match_terms.append(f"({term_ref.expr})")
+            continue
+
+        if term_ref.sample_reg is not None:
+            max_past_depth = max(max_past_depth, delay_to_end)
+            if delay_to_end == 1:
+                match_terms.append(term_ref.sample_reg)
+                continue
+
+            reg_name = f"{prefix}_t{index}"
+            history_depth = delay_to_end - 1
+            declarations.append(declare_history_reg(reg_name, history_depth))
+            clears.append(f"\t\t\t{reg_name} <= {zero_literal(history_depth)};\n")
+            updates.append(shift_assignment(reg_name, history_depth, term_ref.sample_reg))
+            if history_depth == 1:
+                invariants.append(
+                    past_valid_line(
+                        "__SVA_PAST_VALID_PLACEHOLDER__",
+                        2,
+                        f"{reg_name} == {sampled_expr_at_age(term_ref, 2)}",
+                    )
+                )
+                invariants.append(
+                    no_past_valid_line(
+                        "__SVA_PAST_VALID_PLACEHOLDER__",
+                        2,
+                        f"{reg_name} == 1'b0",
+                    )
+                )
+            else:
+                for age in range(history_depth):
+                    invariants.append(
+                        past_valid_line(
+                            "__SVA_PAST_VALID_PLACEHOLDER__",
+                            age + 2,
+                            f"{reg_name}[{age}] == {sampled_expr_at_age(term_ref, age + 2)}",
+                        )
+                    )
+                    invariants.append(
+                        no_past_valid_line(
+                            "__SVA_PAST_VALID_PLACEHOLDER__",
+                            age + 2,
+                            f"{reg_name}[{age}] == 1'b0",
+                        )
+                    )
+            match_terms.append(reg_name if history_depth == 1 else f"{reg_name}[{history_depth - 1}]")
             continue
 
         reg_name = f"{prefix}_t{index}"
         declarations.append(declare_history_reg(reg_name, delay_to_end))
         clears.append(f"\t\t\t{reg_name} <= {zero_literal(delay_to_end)};\n")
-        updates.append(shift_assignment(reg_name, delay_to_end, term))
+        updates.append(shift_assignment(reg_name, delay_to_end, term_ref.expr))
         max_past_depth = max(max_past_depth, delay_to_end)
         if delay_to_end == 1:
             invariants.append(
                 past_valid_line(
                     "__SVA_PAST_VALID_PLACEHOLDER__",
                     1,
-                    f"{reg_name} == {past_expr(term, 1)}",
+                    f"{reg_name} == {sampled_expr_at_age(term_ref, 1)}",
                 )
             )
             invariants.append(
@@ -871,7 +1059,7 @@ def compile_fixed_sequence(seq: FixedSequence, prefix: str) -> SequenceLogic:
                     past_valid_line(
                         "__SVA_PAST_VALID_PLACEHOLDER__",
                         age + 1,
-                        f"{reg_name}[{age}] == {past_expr(term, age + 1)}",
+                        f"{reg_name}[{age}] == {sampled_expr_at_age(term_ref, age + 1)}",
                     )
                 )
                 invariants.append(
@@ -910,10 +1098,6 @@ def disjunction_expr(parts: list[str]) -> str:
     return "(" + " || ".join(parts) + ")"
 
 
-def sample_expr_at_age(expr: str, age: int) -> str:
-    return f"({expr})" if age == 0 else past_expr(expr, age)
-
-
 def shift_formula(expr: str, amount: int) -> str:
     return expr if amount == 0 else past_expr(expr, amount)
 
@@ -936,7 +1120,7 @@ def compile_counted_token_offsets(token: TermToken, max_offset: int) -> dict[int
     width = max(1, (max_offset + 1).bit_length())
     match_offsets: dict[int, str] = {}
     for offset in range(max_offset + 1):
-        samples = [sample_expr_at_age(token.expr, age) for age in range(offset + 1)]
+        samples = [token_sample_expr_at_age(token, age) for age in range(offset + 1)]
         sum_terms = [f"(({sample}) ? {width}'d1 : {width}'d0)" for sample in samples]
         count_expr = " + ".join(sum_terms)
         parts = [range_compare_expr(count_expr, token.repeat_min, token.repeat_max, width)]
@@ -951,7 +1135,7 @@ def compile_consecutive_token_offsets(token: TermToken) -> dict[int, str]:
     for length in range(token.repeat_min, token.repeat_max + 1):
         offset = length - 1
         match_offsets[offset] = conjunction_expr(
-            [sample_expr_at_age(token.expr, age) for age in range(length)]
+            [token_sample_expr_at_age(token, age) for age in range(length)]
         )
     return match_offsets
 
@@ -1004,7 +1188,7 @@ def build_pattern_offset_formulas(
 def token_paths(token: TermToken) -> list[PathMatch]:
     paths: list[PathMatch] = []
     for length in range(token.repeat_min, token.repeat_max + 1):
-        samples = [(age, token.expr) for age in range(length)]
+        samples = [(age, token) for age in range(length)]
         paths.append(PathMatch(start_offset=length - 1, samples=samples))
     return paths
 
@@ -1041,8 +1225,9 @@ def enumerate_pattern_paths(pattern: PatternSequence) -> list[PathMatch]:
 def render_path_expr(path: PathMatch) -> str:
     body_terms: list[str] = []
     max_offset = 0
-    for offset, expr in path.samples:
-        normalized = strip_wrapping_parens(expr)
+    for offset, token in path.samples:
+        sample = token_sample_expr_at_age(token, offset)
+        normalized = strip_wrapping_parens(sample)
         max_offset = max(max_offset, offset)
         if normalized == "1'b1":
             body_terms.append("1'b1")
@@ -1050,10 +1235,7 @@ def render_path_expr(path: PathMatch) -> str:
         if normalized == "1'b0":
             body_terms.append("1'b0")
             continue
-        if offset == 0:
-            body_terms.append(f"({expr})")
-        else:
-            body_terms.append(past_expr(expr, offset))
+        body_terms.append(sample)
     body = conjunction_expr(body_terms)
     if max_offset == 0:
         return body
@@ -1065,7 +1247,9 @@ def compile_pattern_sequence(
     prefix: str,
     bounded_eventual_depth: int | None = None,
 ) -> SequenceLogic:
-    del prefix
+    seq, sample_declarations, sample_clears, sample_updates = materialize_pattern_sequence(
+        seq, prefix
+    )
     if pattern_requires_bounded_lowering(seq):
         raw_offsets = build_pattern_offset_formulas(seq, bounded_eventual_depth)
         if not raw_offsets:
@@ -1084,9 +1268,9 @@ def compile_pattern_sequence(
             offset_exprs.setdefault(path.start_offset, []).append(render_path_expr(path))
         match_offsets = {offset: disjunction_expr(exprs) for offset, exprs in offset_exprs.items()}
     return SequenceLogic(
-        declarations=[],
-        clears=[],
-        updates=[],
+        declarations=sample_declarations,
+        clears=sample_clears,
+        updates=sample_updates,
         invariants=[],
         match_expr=disjunction_expr(list(match_offsets.values())),
         match_offsets=match_offsets,
@@ -1095,6 +1279,74 @@ def compile_pattern_sequence(
 
 
 def compile_history(expr: str, prefix: str, depth: int) -> HistoryLogic:
+    declarations: list[str] = []
+    clears: list[str] = []
+    updates: list[str] = []
+    ref = SampledExprRef(expr)
+    if needs_sample_alias(expr):
+        sample_reg = f"{prefix}_sample"
+        declarations.append(declare_history_reg(sample_reg, 1))
+        clears.append(f"\t\t\t{sample_reg} <= 1'b0;\n")
+        updates.append(shift_assignment(sample_reg, 1, expr))
+        ref = SampledExprRef(expr, sample_reg)
+
+    if ref.sample_reg is not None:
+        if depth == 1:
+            return HistoryLogic(
+                declarations=declarations,
+                clears=clears,
+                updates=updates,
+                invariants=[],
+                mature_expr=ref.sample_reg,
+                max_past_depth=1,
+            )
+
+        reg_name = f"{prefix}_hist"
+        history_depth = depth - 1
+        invariants: list[str] = []
+        declarations.append(declare_history_reg(reg_name, history_depth))
+        clears.append(f"\t\t\t{reg_name} <= {zero_literal(history_depth)};\n")
+        updates.append(shift_assignment(reg_name, history_depth, ref.sample_reg))
+        if history_depth == 1:
+            invariants.append(
+                past_valid_line(
+                    "__SVA_PAST_VALID_PLACEHOLDER__",
+                    2,
+                    f"{reg_name} == {sampled_expr_at_age(ref, 2)}",
+                )
+            )
+            invariants.append(
+                no_past_valid_line(
+                    "__SVA_PAST_VALID_PLACEHOLDER__",
+                    2,
+                    f"{reg_name} == 1'b0",
+                )
+            )
+        else:
+            for age in range(history_depth):
+                invariants.append(
+                    past_valid_line(
+                        "__SVA_PAST_VALID_PLACEHOLDER__",
+                        age + 2,
+                        f"{reg_name}[{age}] == {sampled_expr_at_age(ref, age + 2)}",
+                    )
+                )
+                invariants.append(
+                    no_past_valid_line(
+                        "__SVA_PAST_VALID_PLACEHOLDER__",
+                        age + 2,
+                        f"{reg_name}[{age}] == 1'b0",
+                    )
+                )
+        return HistoryLogic(
+            declarations=declarations,
+            clears=clears,
+            updates=updates,
+            invariants=invariants,
+            mature_expr=reg_name if history_depth == 1 else f"{reg_name}[{history_depth - 1}]",
+            max_past_depth=depth,
+        )
+
     reg_name = f"{prefix}_hist"
     invariants: list[str] = []
     if depth == 1:
@@ -1102,7 +1354,7 @@ def compile_history(expr: str, prefix: str, depth: int) -> HistoryLogic:
             past_valid_line(
                 "__SVA_PAST_VALID_PLACEHOLDER__",
                 1,
-                f"{reg_name} == {past_expr(expr, 1)}",
+                f"{reg_name} == {sampled_expr_at_age(ref, 1)}",
             )
         )
         invariants.append(
@@ -1118,7 +1370,7 @@ def compile_history(expr: str, prefix: str, depth: int) -> HistoryLogic:
                 past_valid_line(
                     "__SVA_PAST_VALID_PLACEHOLDER__",
                     age + 1,
-                    f"{reg_name}[{age}] == {past_expr(expr, age + 1)}",
+                    f"{reg_name}[{age}] == {sampled_expr_at_age(ref, age + 1)}",
                 )
             )
             invariants.append(
@@ -1129,9 +1381,9 @@ def compile_history(expr: str, prefix: str, depth: int) -> HistoryLogic:
                 )
             )
     return HistoryLogic(
-        declarations=[declare_history_reg(reg_name, depth)],
-        clears=[f"\t\t\t{reg_name} <= {zero_literal(depth)};\n"],
-        updates=[shift_assignment(reg_name, depth, expr)],
+        declarations=declarations + [declare_history_reg(reg_name, depth)],
+        clears=clears + [f"\t\t\t{reg_name} <= {zero_literal(depth)};\n"],
+        updates=updates + [shift_assignment(reg_name, depth, expr)],
         invariants=invariants,
         mature_expr=reg_name if depth == 1 else f"{reg_name}[{depth - 1}]",
         max_past_depth=depth,
@@ -1337,13 +1589,16 @@ def emit_simple_ranged_delay_implication(
     antecedent: SequenceLogic,
     pattern: PatternSequence,
 ) -> str:
+    pattern, sample_declarations, sample_clears, sample_updates = materialize_pattern_sequence(
+        pattern, f"{prefix}_con"
+    )
     parsed = simple_ranged_delay(pattern)
     assert parsed is not None
     delay, term_expr = parsed
 
-    declarations = list(antecedent.declarations)
-    clears = list(antecedent.clears)
-    updates = list(antecedent.updates)
+    declarations = list(antecedent.declarations) + sample_declarations
+    clears = list(antecedent.clears) + sample_clears
+    updates = list(antecedent.updates) + sample_updates
     invariants = list(antecedent.invariants)
     max_past_depth = antecedent.max_past_depth
 
@@ -1394,12 +1649,15 @@ def emit_stateful_bounded_pattern_implication(
     if bounded_eventual_depth < 0:
         raise ValueError("Lowering depth must be non-negative")
 
+    pattern, sample_declarations, sample_clears, sample_updates = materialize_pattern_sequence(
+        pattern, f"{prefix}_con"
+    )
     automaton = build_pattern_automaton(pattern)
     closures = epsilon_closures(automaton)
 
-    declarations = list(antecedent.declarations)
-    clears = list(antecedent.clears)
-    updates = list(antecedent.updates)
+    declarations = list(antecedent.declarations) + sample_declarations
+    clears = list(antecedent.clears) + sample_clears
+    updates = list(antecedent.updates) + sample_updates
     invariants = list(antecedent.invariants)
     max_past_depth = antecedent.max_past_depth
 
@@ -1537,9 +1795,12 @@ def emit_pattern_implication(
     pattern: PatternSequence,
     bounded_eventual_depth: int | None = None,
 ) -> str:
-    declarations = list(antecedent.declarations)
-    clears = list(antecedent.clears)
-    updates = list(antecedent.updates)
+    pattern, sample_declarations, sample_clears, sample_updates = materialize_pattern_sequence(
+        pattern, f"{prefix}_con"
+    )
+    declarations = list(antecedent.declarations) + sample_declarations
+    clears = list(antecedent.clears) + sample_clears
+    updates = list(antecedent.updates) + sample_updates
     invariants = list(antecedent.invariants)
     max_past_depth = antecedent.max_past_depth
 

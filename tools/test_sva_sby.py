@@ -41,7 +41,7 @@ endmodule
 """
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             source_requires_ebmc(
                 """module top(input logic clk, input logic a);
 assert property (@(posedge clk) $rose(a) |=> a);

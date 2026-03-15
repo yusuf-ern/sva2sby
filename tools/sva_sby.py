@@ -68,7 +68,6 @@ EBMC_REQUIRED_RE = re.compile(
     |\bs_nexttime\b
     |\bnexttime\b
     |\bimplies\b
-    |\$(?:rose|fell|stable|changed)\s*\(
     """,
     re.MULTILINE | re.VERBOSE,
 )
@@ -1183,7 +1182,9 @@ def main() -> int:
             print("sva_sby: --top is required when input is a .sv file", file=sys.stderr)
             return 2
         source_text = args.input.read_text()
-        use_ebmc = args.backend == "ebmc" or source_requires_ebmc(source_text)
+        use_ebmc = args.backend == "ebmc" or (
+            args.backend == "auto" and source_requires_ebmc(source_text)
+        )
         lowered = args.workdir / "lowered.sv"
         if args.backend == "auto" and not use_ebmc:
             try:

@@ -248,6 +248,47 @@ endmodule
         self.assertNotIn("[=2]", lowered)
         self.assertIn("assert (", lowered)
 
+    def test_normalizes_event_functions_in_property_terms(self) -> None:
+        source = """
+module top(input logic clk, input logic a, input logic b);
+property p_events;
+    @(posedge clk) $rose(a) |=> $fell(b) ##1 $stable(a) ##1 $changed(b);
+endproperty
+assert property (p_events);
+endmodule
+"""
+        lowered = lower_text(source)
+        self.assertNotIn("$rose(", lowered)
+        self.assertNotIn("$fell(", lowered)
+        self.assertNotIn("$stable(", lowered)
+        self.assertNotIn("$changed(", lowered)
+        self.assertIn("!($past((a)))", lowered)
+        self.assertIn("($past((b)))", lowered)
+        self.assertIn("== ($past((a)))", lowered)
+        self.assertIn("!= ($past((b)))", lowered)
+        self.assertIn("reg __sva_assert_p_events_ant_s0;", lowered)
+        self.assertIn("reg __sva_assert_p_events_con_s1;", lowered)
+        self.assertIn("$past((__sva_assert_p_events_con_s0))", lowered)
+        self.assertNotIn("$past(((((a) == ($past((a))))))", lowered)
+
+    def test_event_functions_use_sample_aliases_for_history(self) -> None:
+        source = """
+module top(input logic clk, input logic a);
+property p;
+    @(posedge clk) $stable(a) |=> a || !a;
+endproperty
+assert property (p);
+endmodule
+"""
+        lowered = lower_text(source)
+        self.assertIn("reg __sva_assert_p_ant_s0;", lowered)
+        self.assertIn("reg __sva_assert_p_launch_sample;", lowered)
+        self.assertIn(
+            "if ((__sva_assert_p_past_valid && __sva_assert_p_launch_sample)) assert ((a || !a));",
+            lowered,
+        )
+        self.assertNotIn("$past(((((a) == ($past((a))))))", lowered)
+
 
 if __name__ == "__main__":
     unittest.main()
