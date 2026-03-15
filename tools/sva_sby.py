@@ -489,7 +489,6 @@ def override_engines(
 
         rewritten: list[str] = []
         skip_block_for: str | None = None
-        replaced: set[str] = set()
 
         for line in section.body:
             if skip_block_for is not None:
@@ -509,7 +508,6 @@ def override_engines(
             if tag is None:
                 if not targets and body.strip() and body.strip() != "--" and not body.lstrip().startswith("#"):
                     rewritten.append(f"{indent}{engine_override}{newline}")
-                    replaced.add("")
                 else:
                     rewritten.append(line)
                 continue
@@ -521,12 +519,10 @@ def override_engines(
 
             if body.strip():
                 rewritten.append(f"{indent}{task_name}: {engine_override}{newline}")
-                replaced.add(task_name)
                 continue
 
             rewritten.append(line)
             rewritten.append(f"{engine_override}{newline}")
-            replaced.add(task_name)
             skip_block_for = task_name
 
         section.body = rewritten
@@ -756,7 +752,7 @@ def extract_task_top_and_sources(
     return top, source_paths
 
 
-def ebmc_flags_for_engine(engine: str | None, mode: str) -> tuple[list[str], list[str]]:
+def ebmc_flags_for_engine(engine: str | None) -> tuple[list[str], list[str]]:
     solver_flags: list[str] = []
     method_flags: list[str] = []
     tokens = set((engine or "").split())
@@ -765,8 +761,6 @@ def ebmc_flags_for_engine(engine: str | None, mode: str) -> tuple[list[str], lis
         if solver in tokens:
             solver_flags = [f"--{solver}"]
             break
-
-    del mode
 
     return solver_flags, method_flags
 
@@ -790,10 +784,7 @@ def build_ebmc_task_configs(
             for section in sections:
                 if section.name == "engines":
                     engine_lines.extend(iter_task_section_lines(section, task))
-        solver_flags, method_flags = ebmc_flags_for_engine(
-            engine_override or " ".join(engine_lines),
-            mode,
-        )
+        solver_flags, method_flags = ebmc_flags_for_engine(engine_override or " ".join(engine_lines))
         configs.append(
             EbmcTaskConfig(
                 name=task or "default",
@@ -929,7 +920,7 @@ def main() -> int:
             except ValueError:
                 use_ebmc = True
         if use_ebmc:
-            solver_flags, method_flags = ebmc_flags_for_engine(args.engine, args.mode)
+            solver_flags, method_flags = ebmc_flags_for_engine(args.engine)
             config = EbmcTaskConfig(
                 name="direct",
                 mode=args.mode,

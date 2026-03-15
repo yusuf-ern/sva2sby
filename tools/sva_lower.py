@@ -80,7 +80,6 @@ FIXED_HOLD_RE = re.compile(
     re.DOTALL,
 )
 
-LEADING_DELAY_RE = re.compile(r"^\s*##\s*(?P<delay>\d+)\s*(?P<rest>.+)$", re.DOTALL)
 BOUNDED_REPEAT_RE = re.compile(
     r"^(?P<expr>.+?)\s*\[\s*\*\s*(?P<min>\d+)\s*(?::\s*(?P<max>\d+)\s*)?\]\s*$",
     re.DOTALL,
@@ -396,17 +395,6 @@ def find_implication(expr: str) -> tuple[str, str, str] | None:
     return None
 
 
-def parse_sequence_items(expr: str) -> tuple[list[str], list[int]]:
-    parts = re.split(r"\s*##\s*(\d+)\s*", strip_trailing_semicolon(expr))
-    terms = [part.strip() for part in parts[::2]]
-    delays = [int(part) for part in parts[1::2]]
-    if any(not term for term in terms):
-        raise ValueError(f"Malformed sequence expression '{expr.strip()}'")
-    if len(delays) != len(terms) - 1:
-        raise ValueError(f"Malformed sequence expression '{expr.strip()}'")
-    return terms, delays
-
-
 def split_sequence_parts(expr: str) -> tuple[list[str], list[DelayRange]]:
     stripped = strip_trailing_semicolon(expr)
     terms: list[str] = []
@@ -530,39 +518,6 @@ def pattern_to_fixed(pattern: PatternSequence) -> FixedSequence:
         terms=[term.expr for term in pattern.terms],
         delays=[delay.min for delay in pattern.delays],
     )
-
-
-def flatten_fixed_sequence(
-    expr: str,
-    sequence_defs: dict[str, str],
-    active: tuple[str, ...] = (),
-) -> FixedSequence:
-    raw_terms, raw_delays = parse_sequence_items(expr)
-    flat_terms: list[str] = []
-    flat_delays: list[int] = []
-
-    for index, raw_term in enumerate(raw_terms):
-        term = strip_wrapping_parens(raw_term)
-        if term in sequence_defs:
-            if term in active:
-                cycle = " -> ".join(active + (term,))
-                raise ValueError(f"Recursive sequence reference is unsupported: {cycle}")
-            nested = parse_sequence_expr(sequence_defs[term], sequence_defs, active + (term,))
-            if not isinstance(nested, FixedSequence):
-                raise ValueError(f"Named sequence '{term}' uses unsupported operators")
-        else:
-            nested = FixedSequence([term], [])
-
-        if not flat_terms:
-            flat_terms.extend(nested.terms)
-            flat_delays.extend(nested.delays)
-            continue
-
-        flat_delays.append(raw_delays[index - 1])
-        flat_terms.extend(nested.terms)
-        flat_delays.extend(nested.delays)
-
-    return FixedSequence(flat_terms, flat_delays)
 
 
 def parse_sequence_expr(
@@ -997,18 +952,6 @@ def simple_ranged_delay(pattern: PatternSequence) -> tuple[DelayRange, str] | No
     if delay.min == delay.max:
         return None
     return delay, pattern.terms[1].expr
-
-
-def terminal_repetition_min_sequence(pattern: PatternSequence) -> FixedSequence | None:
-    if len(pattern.terms) != 1 or pattern.delays:
-        return None
-    token = pattern.terms[0]
-    if token.repeat_min == 1:
-        return None
-    return FixedSequence(
-        terms=[token.expr] * token.repeat_min,
-        delays=[1] * (token.repeat_min - 1),
-    )
 
 
 def ranged_delay_assignment(name: str, depth: int, launch_expr: str, term_expr: str, delay: DelayRange) -> str:
