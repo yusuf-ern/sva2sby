@@ -1,0 +1,13 @@
+[options]
+mode cover
+depth 4
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv cover_same_cycle_hit.sv
+prep -top cover_same_cycle_hit
+
+[files]
+cover_same_cycle_hit.sv

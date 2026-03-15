@@ -1,0 +1,13 @@
+[options]
+mode cover
+depth 6
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv cover_disable_iff_hit.sv
+prep -top cover_disable_iff_hit
+
+[files]
+cover_disable_iff_hit.sv

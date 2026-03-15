@@ -1,0 +1,23 @@
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+cover: mode cover
+depth 4
+
+[engines]
+prove:
+smtbmc yices
+--
+cover:
+smtbmc yices
+--
+
+[script]
+read -formal -sv assert_raw_delay_pass.sv
+prep -top assert_raw_delay_pass
+
+[files]
+assert_raw_delay_pass.sv

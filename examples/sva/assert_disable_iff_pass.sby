@@ -1,0 +1,13 @@
+[options]
+mode bmc
+depth 6
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv assert_disable_iff_pass.sv
+prep -top assert_disable_iff_pass
+
+[files]
+assert_disable_iff_pass.sv

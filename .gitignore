@@ -1,0 +1,5 @@
+build/
+__pycache__/
+tools/__pycache__/
+*.pyc
+Concurent_AST1.pdf:Zone.Identifier

@@ -1,0 +1,18 @@
+[tasks]
+bmc
+prove
+
+[options]
+bmc: mode bmc
+prove: mode prove
+depth 6
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv assert_goto_pass.sv
+prep -top assert_goto_pass
+
+[files]
+assert_goto_pass.sv

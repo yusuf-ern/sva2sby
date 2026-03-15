@@ -1,0 +1,13 @@
+[options]
+mode cover
+depth 4
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv cover_named_delay_miss.sv
+prep -top cover_named_delay_miss
+
+[files]
+cover_named_delay_miss.sv

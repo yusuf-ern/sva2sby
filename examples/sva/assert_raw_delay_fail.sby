@@ -1,0 +1,13 @@
+[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv assert_raw_delay_fail.sv
+prep -top assert_raw_delay_fail
+
+[files]
+assert_raw_delay_fail.sv
