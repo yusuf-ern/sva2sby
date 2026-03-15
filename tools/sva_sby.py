@@ -13,10 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OSS_CAD_BIN = Path("/tool/formal_tools/oss-cad-suite/bin")
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from sva_lower import lower_file, lower_text  # noqa: E402
+from sva_lower import (  # noqa: E402
+    ACTION_LINE_RE,
+    DEFAULT_CLOCKING_RE,
+    DEFAULT_DISABLE_RE,
+    lower_file,
+    lower_text,
+)
 
 SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
 SVA_HINT_RE = re.compile(
@@ -46,10 +51,10 @@ VERIFIC_READ_RE = re.compile(r"^\s*read\s+-verific(?:\s+.*)?$")
 READ_SV_RE = re.compile(r"\bread\b.*\B-sv\b(?P<rest>.*)$")
 PREP_TOP_RE = re.compile(r"\bprep\b.*\B-top\s+(?P<top>\S+)")
 HIER_TOP_RE = re.compile(r"\bhierarchy\b.*\B-top\s+(?P<top>\S+)")
+BOUNDED_EVENTUAL_RE = re.compile(r"\[\s*(?:->|=)\s*\d")
 EBMC_REQUIRED_RE = re.compile(
     r"""
-    \[\s*(?:->|=)\s*\d
-    |\bwithin\b
+    \bwithin\b
     |\bthroughout\b
     |\bintersect\b
     |\bfirst_match\b
@@ -63,6 +68,7 @@ EBMC_REQUIRED_RE = re.compile(
     |\bs_nexttime\b
     |\bnexttime\b
     |\bimplies\b
+    |\$(?:rose|fell|stable|changed)\s*\(
     """,
     re.MULTILINE | re.VERBOSE,
 )
@@ -111,6 +117,7 @@ class PreparedSv:
     original_text: str
     modules: dict[str, list[str]]
     binds: list[BindSpec]
+    uses_bounded_eventual: bool
 
 
 @dataclass
@@ -203,6 +210,20 @@ def source_requires_ebmc(text: str) -> bool:
     return bool(EBMC_REQUIRED_RE.search(text))
 
 
+def source_uses_bounded_eventual(text: str) -> bool:
+    return bool(BOUNDED_EVENTUAL_RE.search(text))
+
+
+def engine_is_smtbmc(engine: str | None) -> bool:
+    if engine is None or not engine.strip():
+        return True
+    return "smtbmc" in engine.split()
+
+
+def induction_prove_depth(bound: int) -> int:
+    return max(bound, bound * 2)
+
+
 def stage_source_path_raw(source_path: Path, staged_path: Path) -> None:
     staged_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.is_dir():
@@ -211,12 +232,74 @@ def stage_source_path_raw(source_path: Path, staged_path: Path) -> None:
     shutil.copy2(source_path, staged_path)
 
 
-def lower_or_keep_text(text: str, origin: str) -> str:
+def normalize_ebmc_text(text: str) -> str:
+    default_clock: str | None = None
+    default_disable: str | None = None
+    filtered_lines: list[str] = []
+
+    for line in text.splitlines(keepends=True):
+        clock_match = DEFAULT_CLOCKING_RE.fullmatch(line.strip())
+        if clock_match:
+            if default_clock is None:
+                default_clock = clock_match.group("clock").strip()
+            filtered_lines.append(f"// sva_sby: removed default clocking {default_clock}\n")
+            continue
+
+        disable_match = DEFAULT_DISABLE_RE.fullmatch(line.strip())
+        if disable_match:
+            if default_disable is None:
+                default_disable = disable_match.group("disable").strip()
+            filtered_lines.append(f"// sva_sby: removed default disable iff ({default_disable})\n")
+            continue
+
+        filtered_lines.append(line)
+
+    if default_clock is None:
+        return "".join(filtered_lines)
+
+    rewritten: list[str] = []
+    for line in filtered_lines:
+        match = ACTION_LINE_RE.fullmatch(line.rstrip("\n"))
+        if match is None:
+            rewritten.append(line)
+            continue
+
+        body = match.group("body").strip()
+        if "@(" in body:
+            rewritten.append(line)
+            continue
+
+        prefix = f"@(posedge {default_clock}) "
+        if default_disable is not None:
+            prefix += f"disable iff ({default_disable}) "
+        rewritten.append(
+            f"{match.group('indent')}{match.group('kind')} property ({prefix}{body});\n"
+        )
+
+    return "".join(rewritten)
+
+
+def stage_ebmc_source_path(source_path: Path, staged_path: Path) -> None:
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.suffix in LOWERABLE_SUFFIXES and source_path.is_file():
+        staged_path.write_text(normalize_ebmc_text(source_path.read_text()))
+        return
+    if source_path.is_dir():
+        shutil.copytree(source_path, staged_path, dirs_exist_ok=True)
+        return
+    shutil.copy2(source_path, staged_path)
+
+
+def lower_or_keep_text(
+    text: str,
+    origin: str,
+    bounded_eventual_depth: int | None = None,
+) -> str:
     if not SVA_HINT_RE.search(text):
         return text
 
     try:
-        return lower_text(text)
+        return lower_text(text, bounded_eventual_depth=bounded_eventual_depth)
     except ValueError as exc:
         if str(exc) in {
             "No supported property statements were found",
@@ -228,10 +311,20 @@ def lower_or_keep_text(text: str, origin: str) -> str:
         raise ValueError(f"sva_sby: failed to lower {origin}: {exc}") from exc
 
 
-def stage_source_path(source_path: Path, staged_path: Path) -> None:
+def stage_source_path(
+    source_path: Path,
+    staged_path: Path,
+    bounded_eventual_depth: int | None = None,
+) -> None:
     staged_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.suffix in LOWERABLE_SUFFIXES and source_path.is_file():
-        staged_path.write_text(lower_or_keep_text(source_path.read_text(), str(source_path)))
+        staged_path.write_text(
+            lower_or_keep_text(
+                source_path.read_text(),
+                str(source_path),
+                bounded_eventual_depth=bounded_eventual_depth,
+            )
+        )
         return
     if source_path.is_dir():
         shutil.copytree(source_path, staged_path, dirs_exist_ok=True)
@@ -375,8 +468,12 @@ def inject_formal_instances(text: str, instances: list[str]) -> str:
     return text[:insert_at] + block + text[insert_at:]
 
 
-def prepare_sv_source(text: str, origin: str) -> PreparedSv:
-    lowered = lower_or_keep_text(text, origin)
+def prepare_sv_source(
+    text: str,
+    origin: str,
+    bounded_eventual_depth: int | None,
+) -> PreparedSv:
+    lowered = lower_or_keep_text(text, origin, bounded_eventual_depth=bounded_eventual_depth)
     stripped, binds = strip_bind_lines(lowered)
     return PreparedSv(
         staged_rel=Path(),
@@ -384,6 +481,7 @@ def prepare_sv_source(text: str, origin: str) -> PreparedSv:
         original_text=lowered,
         modules=parse_module_ports(stripped),
         binds=binds,
+        uses_bounded_eventual=source_uses_bounded_eventual(text),
     )
 
 
@@ -393,6 +491,8 @@ def rewrite_files_line(
     workdir: Path,
     script_rewrites: dict[str, str],
     prepared_sv: dict[str, PreparedSv],
+    bounded_source_tokens: set[str],
+    bounded_eventual_depth: int | None,
 ) -> str:
     stripped = line.strip()
     if not stripped or stripped.startswith("#") or stripped == "--":
@@ -419,13 +519,24 @@ def rewrite_files_line(
     staged_rel = stage_relative_path(dest_entry)
     source_path = resolve_source_path(source_dir, source_entry)
     if source_path.suffix in LOWERABLE_SUFFIXES and source_path.is_file():
-        prepared = prepare_sv_source(source_path.read_text(), str(source_path))
+        prepared = prepare_sv_source(
+            source_path.read_text(),
+            str(source_path),
+            bounded_eventual_depth,
+        )
         prepared.staged_rel = staged_rel
         for bind in prepared.binds:
             bind.source_dest = dest_entry
         prepared_sv[dest_entry] = prepared
+        if prepared.uses_bounded_eventual:
+            bounded_source_tokens.add(source_entry)
+            bounded_source_tokens.add(Path(source_entry).name)
     else:
-        stage_source_path(source_path, workdir / staged_rel)
+        stage_source_path(
+            source_path,
+            workdir / staged_rel,
+            bounded_eventual_depth=bounded_eventual_depth,
+        )
     script_rewrites[source_entry] = dest_entry
     return f"{prefix}{dest_entry} {staged_rel.as_posix()}{comment}{newline}"
 
@@ -528,6 +639,134 @@ def override_engines(
         section.body = rewritten
 
 
+def selected_task_names(sections: list[SbySection], requested_tasks: list[str]) -> list[str]:
+    declared = collect_declared_tasks(sections)
+    if requested_tasks:
+        return requested_tasks
+    if declared:
+        return declared
+    return [""]
+
+
+def max_selected_depth(sections: list[SbySection], requested_tasks: list[str]) -> int:
+    return max(extract_task_mode_depth(sections, task)[1] for task in selected_task_names(sections, requested_tasks))
+
+
+def extract_task_engine(sections: list[SbySection], task: str) -> str:
+    lines: list[str] = []
+    for section in sections:
+        if section.name == "engines":
+            lines.extend(iter_task_section_lines(section, task))
+    return " ".join(lines)
+
+
+def task_uses_bounded_eventual_sources(
+    sections: list[SbySection], task: str, bounded_source_tokens: set[str]
+) -> bool:
+    if not bounded_source_tokens:
+        return False
+
+    saw_read = False
+    for section in sections:
+        if section.name != "script":
+            continue
+        for line in iter_task_section_lines(section, task):
+            read_match = READ_SV_RE.search(line)
+            if read_match is None:
+                continue
+            saw_read = True
+            tokens = re.findall(r"[^\s]+?\.(?:sv|v)", read_match.group("rest"))
+            if any(token in bounded_source_tokens or Path(token).name in bounded_source_tokens for token in tokens):
+                return True
+
+    return not saw_read and bool(bounded_source_tokens)
+
+
+def override_prove_depths(
+    sections: list[SbySection],
+    depth_overrides: dict[str, int],
+) -> None:
+    if not depth_overrides:
+        return
+
+    global_found = False
+    inline_found = {task: False for task in depth_overrides if task}
+    block_found = {task: False for task in depth_overrides if task}
+
+    for section in sections:
+        if section.name != "options":
+            continue
+
+        rewritten: list[str] = []
+        active_block: str | None = None
+
+        for line in section.body:
+            stripped = line.strip()
+            if active_block is not None:
+                if stripped == "--":
+                    if not block_found.get(active_block, True):
+                        rewritten.append(f"depth {depth_overrides[active_block]}\n")
+                    rewritten.append(line)
+                    active_block = None
+                    continue
+
+                if stripped.startswith("depth "):
+                    rewritten.append(re.sub(r"\bdepth\s+\d+\b", f"depth {depth_overrides[active_block]}", line, count=1))
+                    block_found[active_block] = True
+                    continue
+
+                rewritten.append(line)
+                continue
+
+            prefix_match = TASK_PREFIX_RE.match(line.rstrip("\r\n"))
+            assert prefix_match is not None
+            tag = prefix_match.group("tag")
+            body = prefix_match.group("body")
+
+            if tag is None:
+                if "" in depth_overrides and body.strip().startswith("depth "):
+                    rewritten.append(
+                        re.sub(r"\bdepth\s+\d+\b", f"depth {depth_overrides['']}", line, count=1)
+                    )
+                    global_found = True
+                    continue
+                rewritten.append(line)
+                continue
+
+            task_name = tag.rstrip().rstrip(":")
+            if task_name not in depth_overrides:
+                rewritten.append(line)
+                continue
+
+            if not body.strip():
+                rewritten.append(line)
+                active_block = task_name
+                continue
+
+            if body.strip().startswith("depth "):
+                indent = prefix_match.group("indent")
+                newline = line[len(line.rstrip("\r\n")) :]
+                rewritten.append(f"{indent}{task_name}: depth {depth_overrides[task_name]}{newline}")
+                inline_found[task_name] = True
+                continue
+
+            rewritten.append(line)
+
+        if active_block is not None and not block_found.get(active_block, True):
+            rewritten.append(f"depth {depth_overrides[active_block]}\n")
+
+        if "" in depth_overrides and not global_found:
+            rewritten.append(f"depth {depth_overrides['']}\n")
+            global_found = True
+
+        for task, depth in depth_overrides.items():
+            if task and not inline_found.get(task, False) and not block_found.get(task, False):
+                rewritten.append(f"{task}: depth {depth}\n")
+                inline_found[task] = True
+
+        section.body = rewritten
+
+
 def prepare_sby(
     input_path: Path,
     workdir: Path,
@@ -538,6 +777,7 @@ def prepare_sby(
     source_dir = input_path.resolve().parent
     sections = parse_sby_sections(input_path.read_text())
     override_engines(sections, engine_override, selected_tasks or [])
+    bounded_eventual_depth = max_selected_depth(sections, selected_tasks or [])
     script_sections = [section for section in sections if section.name == "script"]
     if not script_sections:
         raise ValueError("sva_sby: input .sby file has no [script] section")
@@ -546,11 +786,20 @@ def prepare_sby(
     script_rewrites: dict[str, str] = {}
     prepared_sv: dict[str, PreparedSv] = {}
     formal_reads: set[str] = set()
+    bounded_source_tokens: set[str] = set()
     for section in sections:
         if section.name == "files":
             source_section_seen = True
             section.body = [
-                rewrite_files_line(line, source_dir, workdir, script_rewrites, prepared_sv)
+                rewrite_files_line(
+                    line,
+                    source_dir,
+                    workdir,
+                    script_rewrites,
+                    prepared_sv,
+                    bounded_source_tokens,
+                    bounded_eventual_depth,
+                )
                 for line in section.body
             ]
             continue
@@ -561,7 +810,14 @@ def prepare_sby(
         source_section_seen = True
         if Path(section.args).suffix not in LOWERABLE_SUFFIXES:
             continue
-        lowered_text = lower_or_keep_text("".join(section.body), section.args)
+        lowered_text = lower_or_keep_text(
+            "".join(section.body),
+            section.args,
+            bounded_eventual_depth=bounded_eventual_depth,
+        )
+        if source_uses_bounded_eventual("".join(section.body)):
+            bounded_source_tokens.add(section.args)
+            bounded_source_tokens.add(Path(section.args).name)
         if "`ifdef FORMAL" in lowered_text:
             formal_reads.add(section.args)
         section.body = lowered_text.splitlines(keepends=True)
@@ -576,6 +832,10 @@ def prepare_sby(
     passthrough_bind_sources: set[str] = set()
 
     for dest_entry, prepared in prepared_sv.items():
+        if prepared.uses_bounded_eventual:
+            bounded_source_tokens.add(dest_entry)
+            bounded_source_tokens.add(Path(dest_entry).name)
+            bounded_source_tokens.add(prepared.staged_rel.name)
         for module_name, ports in prepared.modules.items():
             if module_name in module_to_dest and module_to_dest[module_name] != dest_entry:
                 raise ValueError(f"sva_sby: duplicate module '{module_name}' across staged sources")
@@ -618,6 +878,20 @@ def prepare_sby(
             for line in section.body
         ]
 
+    depth_overrides: dict[str, int] = {}
+    for task in selected_task_names(sections, selected_tasks or []):
+        mode, depth = extract_task_mode_depth(sections, task)
+        if mode != "prove":
+            continue
+        if not engine_is_smtbmc(extract_task_engine(sections, task)):
+            continue
+        if not task_uses_bounded_eventual_sources(sections, task, bounded_source_tokens):
+            continue
+        expanded_depth = induction_prove_depth(depth)
+        if expanded_depth > depth:
+            depth_overrides[task] = expanded_depth
+    override_prove_depths(sections, depth_overrides)
+
     generated = workdir / "run.sby"
     with generated.open("w") as handle:
         for section in sections:
@@ -657,7 +931,7 @@ def stage_raw_sby_sources(input_path: Path, workdir: Path) -> tuple[list[SbySect
                     continue
                 dest_entry, source_entry = parsed
                 staged_rel = stage_relative_path(dest_entry)
-                stage_source_path_raw(resolve_source_path(source_dir, source_entry), workdir / staged_rel)
+                stage_ebmc_source_path(resolve_source_path(source_dir, source_entry), workdir / staged_rel)
                 staged_sources[source_entry] = staged_rel
                 staged_sources[dest_entry] = staged_rel
             continue
@@ -668,7 +942,7 @@ def stage_raw_sby_sources(input_path: Path, workdir: Path) -> tuple[list[SbySect
         staged_rel = stage_relative_path(section.args)
         staged_file = workdir / staged_rel
         staged_file.parent.mkdir(parents=True, exist_ok=True)
-        staged_file.write_text("".join(section.body))
+        staged_file.write_text(normalize_ebmc_text("".join(section.body)))
         staged_sources[section.args] = staged_rel
         staged_sources[Path(section.args).name] = staged_rel
 
@@ -701,7 +975,7 @@ def sby_requires_ebmc(input_path: Path) -> bool:
 
 def extract_task_mode_depth(sections: list[SbySection], task: str) -> tuple[str, int]:
     mode = "bmc"
-    depth = 5
+    depth = 20
     for section in sections:
         if section.name != "options":
             continue
@@ -826,10 +1100,7 @@ def run_ebmc_task(config: EbmcTaskConfig, workdir: Path, env: dict[str, str]) ->
 
 
 def make_env() -> dict[str, str]:
-    env = os.environ.copy()
-    if OSS_CAD_BIN.is_dir():
-        env["PATH"] = str(OSS_CAD_BIN) + os.pathsep + env.get("PATH", "")
-    return env
+    return os.environ.copy()
 
 
 def main() -> int:
@@ -916,7 +1187,11 @@ def main() -> int:
         lowered = args.workdir / "lowered.sv"
         if args.backend == "auto" and not use_ebmc:
             try:
-                lower_file(args.input, lowered)
+                lower_file(
+                    args.input,
+                    lowered,
+                    bounded_eventual_depth=args.depth,
+                )
             except ValueError:
                 use_ebmc = True
         if use_ebmc:
@@ -935,8 +1210,19 @@ def main() -> int:
             print("sva_sby: sby not found on PATH", file=sys.stderr)
             return 2
         sby_path = args.workdir / "run.sby"
-        lower_file(args.input, lowered)
-        write_sby(sby_path, lowered.name, args.top, args.mode, args.depth, args.engine or "smtbmc")
+        sby_depth = args.depth
+        if (
+            args.mode == "prove"
+            and source_uses_bounded_eventual(source_text)
+            and engine_is_smtbmc(args.engine)
+        ):
+            sby_depth = induction_prove_depth(args.depth)
+        lower_file(
+            args.input,
+            lowered,
+            bounded_eventual_depth=args.depth,
+        )
+        write_sby(sby_path, lowered.name, args.top, args.mode, sby_depth, args.engine or "smtbmc")
 
     result = subprocess.run(
         ["sby", "-f", sby_path.name, *args.tasks],

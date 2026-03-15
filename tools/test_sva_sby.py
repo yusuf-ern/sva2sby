@@ -7,12 +7,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sva_sby import build_ebmc_task_configs, prepare_sby, source_requires_ebmc
+from sva_sby import (
+    build_ebmc_task_configs,
+    normalize_ebmc_text,
+    prepare_sby,
+    source_requires_ebmc,
+)
 
 
 class SvaSbyTests(unittest.TestCase):
     def test_source_requires_ebmc_for_full_sva_operators(self) -> None:
-        self.assertTrue(
+        self.assertFalse(
             source_requires_ebmc(
                 """module top(input logic clk, input logic a, input logic b);
 assert property (@(posedge clk) a |-> b[->2]);
@@ -20,7 +25,7 @@ endmodule
 """
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             source_requires_ebmc(
                 """module top(input logic clk, input logic a, input logic b);
 assert property (@(posedge clk) a |-> b[=2]);
@@ -36,6 +41,27 @@ endmodule
 """
             )
         )
+        self.assertTrue(
+            source_requires_ebmc(
+                """module top(input logic clk, input logic a);
+assert property (@(posedge clk) $rose(a) |=> a);
+endmodule
+"""
+            )
+        )
+
+    def test_normalize_ebmc_text_expands_default_clocking_and_disable(self) -> None:
+        normalized = normalize_ebmc_text(
+            """module top(input logic clock, input logic reset, input logic a, input logic b);
+default clocking @(posedge clock); endclocking
+default disable iff (reset);
+assert property (a |=> b);
+endmodule
+"""
+        )
+        self.assertIn("// sva_sby: removed default clocking clock", normalized)
+        self.assertIn("// sva_sby: removed default disable iff (reset)", normalized)
+        self.assertIn("assert property (@(posedge clock) disable iff (reset) a |=> b);", normalized)
 
     def test_prepare_sby_preserves_mode_and_engines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -161,6 +187,52 @@ endmodule
             lowered_alias_text = lowered_alias.read_text()
             self.assertIn("`ifdef FORMAL", lowered_alias_text)
             self.assertIn("assert (", lowered_alias_text)
+
+    def test_prepare_sby_lowers_goto_repetition_with_task_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            (source_dir / "goto_demo.sv").write_text(
+                """module goto_demo(input logic clk, input logic start, input logic a, input logic done);
+property p;
+    @(posedge clk) start |=> a[->2] ##1 done;
+endproperty
+assert property (p);
+endmodule
+"""
+            )
+            sby_path = source_dir / "goto_demo.sby"
+            sby_path.write_text(
+                """[tasks]
+prove
+
+[options]
+prove: mode prove
+depth 6
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv goto_demo.sv
+prep -top goto_demo
+
+[files]
+goto_demo.sv
+"""
+            )
+
+            generated = prepare_sby(sby_path, workdir)
+            staged = (workdir / "files" / "goto_demo.sv").read_text()
+            generated_text = generated.read_text()
+            self.assertIn("`ifdef FORMAL", staged)
+            self.assertIn("reg [6:0] __sva_assert_p_st2;", staged)
+            self.assertIn("__sva_assert_p_st2[0]", staged)
+            self.assertNotIn("[->2]", staged)
+            self.assertIn("prove: depth 12", generated_text)
 
     def test_prepare_sby_leaves_unsupported_inline_property_files_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -294,6 +366,35 @@ goto_demo.sv
             self.assertEqual(config.method_flags, [])
             self.assertEqual(len(config.sources), 1)
             self.assertTrue(config.sources[0].exists())
+
+    def test_build_ebmc_task_configs_uses_sby_default_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            (source_dir / "demo.sv").write_text("module demo(input logic clk); endmodule\n")
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv demo.sv
+prep -top demo
+
+[files]
+demo.sv
+"""
+            )
+
+            configs = build_ebmc_task_configs(sby_path, workdir, [], None)
+            self.assertEqual(len(configs), 1)
+            self.assertEqual(configs[0].depth, 20)
 
     def test_prepare_sby_leaves_labeled_property_files_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

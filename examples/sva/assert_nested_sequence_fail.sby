@@ -1,0 +1,13 @@
+[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv assert_nested_sequence_fail.sv
+prep -top assert_nested_sequence_fail
+
+[files]
+assert_nested_sequence_fail.sv

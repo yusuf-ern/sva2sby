@@ -5,10 +5,11 @@ prove
 [options]
 bmc: mode bmc
 prove: mode prove
-depth 7
+depth 17
 
 [engines]
-smtbmc yices
+bmc: smtbmc yices
+prove: smtbmc yices
 
 [script]
 read -formal -sv assert_nonconsecutive_pass.sv

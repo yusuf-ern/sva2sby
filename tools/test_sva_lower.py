@@ -137,7 +137,10 @@ endmodule
         self.assertIn("// sva_lower: lowered assert property (p_delay)", lowered)
         self.assertIn("reg __sva_assert_p_delay_con_t0;", lowered)
         self.assertIn("reg __sva_assert_p_delay_launch_hist;", lowered)
-        self.assertIn("if (__sva_assert_p_delay_launch_hist) assert (__sva_assert_p_delay_con_t0 && (b));", lowered)
+        self.assertIn(
+            "if ((__sva_assert_p_delay_past_valid && __sva_assert_p_delay_launch_hist)) assert (__sva_assert_p_delay_con_t0 && (b));",
+            lowered,
+        )
 
     def test_lowers_implication_with_ranged_delay_in_consequent(self) -> None:
         source = """
@@ -199,6 +202,51 @@ endmodule
         self.assertNotIn("old_p", lowered)
         self.assertIn("// sva_lower: lowered assert property (p_ok)", lowered)
         self.assertIn("if ((a)) assert ((b));", lowered)
+
+    def test_goto_repetition_requires_bounded_lowering_depth(self) -> None:
+        source = """
+module top(input logic clk, input logic start, input logic a, input logic done);
+property p_goto;
+    @(posedge clk) start |=> a[->2] ##1 done;
+endproperty
+assert property (p_goto);
+endmodule
+"""
+        with self.assertRaisesRegex(ValueError, "requires a lowering depth"):
+            lower_text(source)
+
+    def test_lowers_goto_repetition_with_bounded_depth(self) -> None:
+        source = """
+module top(input logic clk, input logic start, input logic a, input logic done);
+property p_goto;
+    @(posedge clk) start |=> a[->2] ##1 done;
+endproperty
+assert property (p_goto);
+endmodule
+"""
+        lowered = lower_text(source, bounded_eventual_depth=6)
+        self.assertIn("// sva_lower: lowered assert property (p_goto)", lowered)
+        self.assertIn("reg [6:0] __sva_assert_p_goto_st2;", lowered)
+        self.assertIn("__sva_assert_p_goto_st2[0]", lowered)
+        self.assertNotIn("[->2]", lowered)
+        self.assertIn("&& (a)", lowered)
+        self.assertIn("assert (", lowered)
+
+    def test_lowers_nonconsecutive_repetition_with_bounded_depth(self) -> None:
+        source = """
+module top(input logic clk, input logic start, input logic a, input logic done);
+property p_nonconsecutive;
+    @(posedge clk) start |=> a[=2] ##1 done;
+endproperty
+assert property (p_nonconsecutive);
+endmodule
+"""
+        lowered = lower_text(source, bounded_eventual_depth=6)
+        self.assertIn("// sva_lower: lowered assert property (p_nonconsecutive)", lowered)
+        self.assertIn("reg [6:0] __sva_assert_p_nonconsecutive_st1;", lowered)
+        self.assertIn("__sva_assert_p_nonconsecutive_st1[0]", lowered)
+        self.assertNotIn("[=2]", lowered)
+        self.assertIn("assert (", lowered)
 
 
 if __name__ == "__main__":

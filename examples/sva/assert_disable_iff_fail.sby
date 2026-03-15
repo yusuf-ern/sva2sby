@@ -1,0 +1,13 @@
+[options]
+mode bmc
+depth 7
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv assert_disable_iff_fail.sv
+prep -top assert_disable_iff_fail
+
+[files]
+assert_disable_iff_fail.sv

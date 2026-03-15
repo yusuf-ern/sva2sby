@@ -16,10 +16,10 @@ class FormalCliTests(unittest.TestCase):
             ["sby", "examples/sva/assert_raw_delay_pass.sv"],
         )
 
-    def test_normalize_argv_leaves_subcommand_usage_unchanged(self) -> None:
+    def test_normalize_argv_leaves_explicit_sby_usage_unchanged(self) -> None:
         self.assertEqual(
-            formal.normalize_argv(["example", "assert_raw_delay_pass"]),
-            ["example", "assert_raw_delay_pass"],
+            formal.normalize_argv(["sby", "examples/sva/assert_raw_delay_pass.sv"]),
+            ["sby", "examples/sva/assert_raw_delay_pass.sv"],
         )
 
     def test_default_workdir_for_sby_task(self) -> None:

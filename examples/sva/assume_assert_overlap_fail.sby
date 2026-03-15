@@ -1,0 +1,13 @@
+[options]
+mode bmc
+depth 3
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv assume_assert_overlap_fail.sv
+prep -top assume_assert_overlap_fail
+
+[files]
+assume_assert_overlap_fail.sv

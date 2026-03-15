@@ -5,15 +5,15 @@ prove
 [options]
 bmc: mode bmc
 prove: mode prove
-depth 15
+depth 12
 
 [engines]
 bmc: smtbmc yices
 prove: smtbmc yices
 
 [script]
-read -formal -sv assert_goto_pass.sv
-prep -top assert_goto_pass
+read -formal -sv assert_nonconsecutive_fail.sv
+prep -top assert_nonconsecutive_fail
 
 [files]
-assert_goto_pass.sv
+assert_nonconsecutive_fail.sv

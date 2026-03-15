@@ -14,6 +14,8 @@ support in the current OSS CAD `yosys-slang` + `sby` flow.
 - simple bounded-range implication consequents such as `A |-> ##[M:N] B`
 - bounded-repeat implication consequents such as `A |-> B[*M:N]`
 - chained bounded-repeat consequents such as `A |-> B[*M:N] ##K C`
+- depth-bounded goto repetition consequents such as `A |-> B[->N] ##K C`
+- depth-bounded nonconsecutive repetition consequents such as `A |-> B[=N] ##K C`
 - optional `disable iff (expr)`
 - `assert property (NAME);`
 - `assume property (NAME);`
@@ -23,10 +25,10 @@ The lowered output replaces the unsupported SVA syntax with `always @(posedge
 clk)` blocks and immediate `assert(...)`, `assume(...)`, or `cover(...)`
 statements under `` `ifdef FORMAL ``.
 
-For operators outside that subset, `sva_sby.py` can now switch to an `ebmc`
-backend instead of forcing the source through the lowerer. That keeps the same
-`.sv` / `.sby` front-end while avoiding incorrect source rewriting for full-SVA
-operators such as goto repetition `[->]` and nonconsecutive repetition `[=]`.
+For operators outside that subset, `sva_sby.py` can still switch to an optional
+`ebmc` backend instead of forcing the source through the lowerer. That keeps
+the same `.sv` / `.sby` front-end while avoiding incorrect source rewriting
+for operators the local lowerer still does not model safely.
 
 ## Wrapper
 
@@ -41,6 +43,18 @@ lowered files, and then runs `sby` on that generated config.
 
 In `auto` mode it chooses the lowering path for the supported subset and falls
 back to `ebmc` for operators the lowerer does not model safely.
+
+Goto repetition `[->]` and nonconsecutive repetition `[=]` now stay on the
+pure-`sby` path, but their lowering is explicitly depth-bounded. In practice
+that means:
+
+- `.sv` direct mode uses `--depth` as the lowering bound
+- `.sby` mode uses the selected task depth, or the maximum declared depth when
+  no task is selected
+- `bmc` works with the usual `smtbmc` engines
+- `prove` also works with `smtbmc`, but the wrapper expands the generated
+  induction depth while keeping the lowering bound unchanged
+- stronger engines such as `abc pdr` still work on the same lowered monitor
 
 When the `ebmc` backend is selected for a `.sby` task, the wrapper preserves
 the `.sby` front-end shape (`mode`, `depth`, `top`, selected task, and solver
@@ -64,7 +78,10 @@ on `read -verific` but otherwise fit the lowered subset:
 - `--strip-verific` comments out `read -verific` lines in the generated `.sby`
   without modifying the original file
 
-It assumes `sby` is already on `PATH`, for example:
+It assumes `sby` is already on `PATH`. If you want backend auto-detection to
+use EBMC for unsupported operators, `ebmc` must also be on `PATH`.
+
+Examples:
 
 ```bash
 python3 tools/sva_sby.py /path/to/input.sv --top top_module --engine "smtbmc yices"
@@ -78,10 +95,10 @@ For shorter day-to-day use there is also a repo-local wrapper:
 
 ```bash
 ./formal examples/sva/assert_raw_delay_pass.sby
-./formal /tool/formal_tools/oss-cad-suite/examples/abstract/props.sby prv --compat
+./formal examples/sva/assert_goto_pass.sby prove
+./formal examples/sva/assert_nonconsecutive_pass.sby prove
+./formal path/to/props.sby prv --compat
 ./formal examples/sva/assert_raw_delay_pass.sv
-./formal example assert_raw_delay_pass --tool both
-./formal compare-native --timeout 20 --jobs 4
 ```
 
 When `./formal` is given a `.sby` or `.sv` path directly it defaults to the
@@ -95,6 +112,8 @@ path currently does not handle:
 
 - nested / composed properties
 - general ranged-delay and repetition forms beyond the simple subset above
+- exact unbounded lowering for goto repetition `[->]` and nonconsecutive
+  repetition `[=]`
 - multi-clock properties
 - multicycle bare `assert property` without an implication wrapper
 - lowering multiple-module files in one pass
@@ -115,15 +134,10 @@ Run the local tests with:
 python3 tools/test_sva_lower.py
 ```
 
-Cross-check the local lowering path against `ebmc` with:
-
-```bash
-python3 tools/compare_ebmc_sby.py
-```
-
-That comparison matrix currently matches on the supported subset across
-`assert`, `assume`, `cover`, `|->`, `|=>`, fixed `##N`, named sequences, and
-`disable iff`. The two remaining EBMC-only forms in the matrix are:
+The local lowering path has been cross-checked against `ebmc` on the supported
+subset across `assert`, `assume`, `cover`, `|->`, `|=>`, fixed `##N`, named
+sequences, and `disable iff`. The two remaining EBMC-only forms in that check
+are:
 
 - inline anonymous properties such as `assert property (@(...))`
 - multicycle bare `assert property` without an implication wrapper

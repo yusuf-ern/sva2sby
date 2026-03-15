@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,8 +32,7 @@ def default_workdir_for_input(input_path: Path, tasks: list[str], top: str | Non
 
 
 def run(cmd: list[str]) -> int:
-    env = os.environ.copy()
-    proc = subprocess.run(cmd, cwd=ROOT, env=env, check=False)
+    proc = subprocess.run(cmd, cwd=ROOT, check=False)
     return proc.returncode
 
 
@@ -68,36 +66,6 @@ def handle_sby(args: argparse.Namespace) -> int:
     return run(cmd)
 
 
-def handle_example(args: argparse.Namespace) -> int:
-    cmd = [
-        sys.executable,
-        str(SCRIPT_DIR / "run_sva_example.py"),
-        args.example,
-        "--tool",
-        args.tool,
-    ]
-    if args.bound is not None:
-        cmd.extend(["--bound", str(args.bound)])
-    return run(cmd)
-
-
-def handle_compare_ebmc(args: argparse.Namespace) -> int:
-    cmd = [sys.executable, str(SCRIPT_DIR / "compare_ebmc_sby.py")]
-    if args.workdir is not None:
-        cmd.extend(["--workdir", str(args.workdir)])
-    return run(cmd)
-
-
-def handle_compare_native(args: argparse.Namespace) -> int:
-    cmd = [sys.executable, str(SCRIPT_DIR / "compare_native_sby_wrapper.py")]
-    if args.examples_root is not None:
-        cmd.extend(["--examples-root", str(args.examples_root)])
-    if args.workdir is not None:
-        cmd.extend(["--workdir", str(args.workdir)])
-    cmd.extend(["--timeout", str(args.timeout), "--jobs", str(args.jobs)])
-    return run(cmd)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -125,26 +93,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable wrapper compatibility mode for some Verific-gated .sby examples",
     )
     sby.set_defaults(handler=handle_sby)
-
-    example = subparsers.add_parser("example", help="Run one local SVA example")
-    example.add_argument("example", help="Example name without .sv")
-    example.add_argument("--tool", choices=["ebmc", "sby", "both"], default="both")
-    example.add_argument("--bound", type=int)
-    example.set_defaults(handler=handle_example)
-
-    compare_ebmc = subparsers.add_parser("compare-ebmc", help="Run the local EBMC vs wrapper matrix")
-    compare_ebmc.add_argument("--workdir", type=Path)
-    compare_ebmc.set_defaults(handler=handle_compare_ebmc)
-
-    compare_native = subparsers.add_parser(
-        "compare-native",
-        help="Compare upstream native sby results against the wrapper",
-    )
-    compare_native.add_argument("--examples-root", type=Path)
-    compare_native.add_argument("--workdir", type=Path)
-    compare_native.add_argument("--timeout", type=int, default=20)
-    compare_native.add_argument("--jobs", type=int, default=4)
-    compare_native.set_defaults(handler=handle_compare_native)
 
     return parser
 

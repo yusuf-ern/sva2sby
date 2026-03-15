@@ -1,0 +1,18 @@
+[tasks]
+bmc
+prove
+
+[options]
+bmc: mode bmc
+prove: mode prove
+depth 6
+
+[engines]
+smtbmc
+
+[script]
+read -formal -sv assert_repeat_tail_fail.sv
+prep -top assert_repeat_tail_fail
+
+[files]
+assert_repeat_tail_fail.sv
