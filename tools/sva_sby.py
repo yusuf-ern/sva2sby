@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+TOOL_BIN = ROOT.parents[1] / "oss-cad-suite" / "bin"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from sva_lower import (  # noqa: E402
@@ -344,10 +346,10 @@ def parse_module_ports(text: str) -> dict[str, list[str]]:
                 if not candidate:
                     continue
                 candidate = candidate.split("=")[0].strip()
-                tokens = candidate.split()
-                if not tokens:
+                port_match = re.search(r"(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]+\]\s*)*$", candidate)
+                if port_match is None:
                     continue
-                ports.append(tokens[-1])
+                ports.append(port_match.group("name"))
         modules[match.group("name")] = ports
     return modules
 
@@ -593,6 +595,7 @@ def override_engines(
         return
 
     targets = set(selected_tasks)
+    override_all_tagged = not targets
     for section in sections:
         if section.name != "engines":
             continue
@@ -616,14 +619,14 @@ def override_engines(
             indent = prefix_match.group("indent")
 
             if tag is None:
-                if not targets and body.strip() and body.strip() != "--" and not body.lstrip().startswith("#"):
+                if body.strip() and body.strip() != "--" and not body.lstrip().startswith("#"):
                     rewritten.append(f"{indent}{engine_override}{newline}")
                 else:
                     rewritten.append(line)
                 continue
 
             task_name = tag.rstrip().rstrip(":")
-            if task_name not in targets:
+            if not override_all_tagged and task_name not in targets:
                 rewritten.append(line)
                 continue
 
@@ -865,6 +868,7 @@ def prepare_sby(
 
     for prepared in prepared_sv.values():
         if "`ifdef FORMAL" in prepared.text:
+            formal_reads.add(prepared.staged_rel.relative_to("files").as_posix())
             formal_reads.add(prepared.staged_rel.name)
         staged_file = workdir / prepared.staged_rel
         staged_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1099,7 +1103,13 @@ def run_ebmc_task(config: EbmcTaskConfig, workdir: Path, env: dict[str, str]) ->
 
 
 def make_env() -> dict[str, str]:
-    return os.environ.copy()
+    env = os.environ.copy()
+    if TOOL_BIN.exists():
+        current_path = env.get("PATH", "")
+        current_parts = current_path.split(os.pathsep) if current_path else []
+        if str(TOOL_BIN) not in current_parts:
+            env["PATH"] = os.pathsep.join([str(TOOL_BIN), *current_parts]) if current_parts else str(TOOL_BIN)
+    return env
 
 
 def main() -> int:

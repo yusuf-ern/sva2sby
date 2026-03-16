@@ -1,2 +1,7 @@
 #!/usr/bin/env bash
-exec python3 "$(dirname "$0")/tools/formal.py" "$@"
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+
+exec python3 "${SCRIPT_DIR}/tools/formal.py" "$@"

@@ -467,6 +467,46 @@ demo.sv
             self.assertIn("# sva_sby: stripped read -verific", generated_text)
             self.assertIn("read -sv demo.sv", generated_text)
 
+    def test_prepare_sby_marks_nested_staged_reads_as_formal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            sv_path = source_dir / "orig.sv"
+            sv_path.write_text(
+                """module demo(input logic clk, input logic a, input logic b);
+property p;
+    @(posedge clk) a |=> b;
+endproperty
+assert property (p);
+endmodule
+"""
+            )
+
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc
+
+[script]
+read -sv orig.sv
+prep -top demo
+
+[files]
+rtl/demo.sv orig.sv
+"""
+            )
+
+            generated = prepare_sby(sby_path, workdir)
+            generated_text = generated.read_text()
+            self.assertIn("read -formal -sv rtl/demo.sv", generated_text)
+
     def test_prepare_sby_can_override_task_engine(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -502,6 +542,45 @@ demo.sv
                 workdir,
                 engine_override="smtbmc",
                 selected_tasks=["prv"],
+            )
+            generated_text = generated.read_text()
+            self.assertIn("prv: smtbmc", generated_text)
+            self.assertNotIn("prv: abc pdr", generated_text)
+
+    def test_prepare_sby_overrides_inline_task_engines_without_selected_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            sv_path = source_dir / "demo.sv"
+            sv_path.write_text("module demo; endmodule\n")
+
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[tasks]
+prv
+
+[options]
+prv: mode prove
+
+[engines]
+prv: abc pdr
+
+[script]
+read -sv demo.sv
+prep -top demo
+
+[files]
+demo.sv
+"""
+            )
+
+            generated = prepare_sby(
+                sby_path,
+                workdir,
+                engine_override="smtbmc",
             )
             generated_text = generated.read_text()
             self.assertIn("prv: smtbmc", generated_text)
@@ -601,6 +680,52 @@ formal_bind.sv
             staged_text = (workdir / "files" / "formal_bind.sv").read_text()
             self.assertIn("bind missing_target checker_mod checker_i (.*);", staged_text)
             self.assertNotIn("// sva_sby: removed bind", staged_text)
+
+    def test_prepare_sby_rewrites_bind_ports_with_unpacked_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            (source_dir / "demo.sv").write_text(
+                """module demo(input logic clk, input logic [1:0] bus [2]);
+endmodule
+"""
+            )
+            (source_dir / "props.sv").write_text(
+                """module demo_props(input logic clk, input logic [1:0] bus [2]);
+default clocking @(posedge clk); endclocking
+assert property (bus[0][0]);
+endmodule
+
+bind demo demo_props demo_props_i (.*);
+"""
+            )
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+depth 2
+
+[engines]
+smtbmc
+
+[script]
+read -sv demo.sv
+read -sv props.sv
+prep -top demo
+
+[files]
+demo.sv
+props.sv
+"""
+            )
+
+            prepare_sby(sby_path, workdir)
+            staged_demo = (workdir / "files" / "demo.sv").read_text()
+            self.assertIn(".bus(bus)", staged_demo)
+            self.assertNotIn(".[2]([2])", staged_demo)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,9 @@ This repo explores a middle path:
 - `tools/sva_sby.py`
   Wrapper that accepts either raw `.sv` input or an existing `.sby` file,
   stages the sources, lowers what it can, and runs the formal job.
+- `tools/gui.py`
+  Local web GUI that launches the same wrapper, streams logs, and surfaces
+  generated run artifacts under `build/formal_runs/`.
 - `examples/sva/`
   Runnable passing and failing examples for the supported feature set.
 - `.github/workflows/smoke.yml`
@@ -113,10 +116,42 @@ For unsupported operators:
 ./formal examples/sva/assert_raw_delay_pass.sv
 ./formal examples/sva/assert_goto_pass.sby prove
 ./formal examples/sva/assert_nonconsecutive_fail.sby bmc
+./formal -waves examples/sva/assert_raw_delay_fail.sby
 ```
 
 When given a `.sv` or `.sby` path directly, `formal` automatically routes to
 the wrapper and creates a default workdir under `build/formal_runs/`.
+
+`-waves` / `--waves` scans the generated workdir after the run and opens any
+`trace.vcd` files with `gtkwave` when it is available on `PATH`.
+
+### Run The GUI
+
+```bash
+./formal gui --port 8080
+```
+
+Then open `http://127.0.0.1:8080` in a browser. The GUI can launch custom
+`.sv` / `.sby` inputs from any local project root, browse project/work/input
+paths directly from the form, tail live logs, and preview generated text
+artifacts from each run directory. Relative paths in the form resolve from the
+selected project root, and generated runs default to
+`<project-root>/build/formal_runs/`.
+
+### Install On PATH
+
+The wrapper now prepends the sibling OSS-CAD tool suite bin directory when it
+runs, so bundled tools like `sby`, `ebmc`, and `gtkwave` are found even when
+your shell `PATH` is minimal.
+
+To expose the wrapper itself as a command from anywhere, install the repo entry
+point into the suite bin directory:
+
+```bash
+bash tools/install_bin_link.sh
+enhanced-oss-cad examples/sva/assert_raw_delay_pass.sby
+enhanced-oss-cad gui --port 8080
+```
 
 ### Run The Smoke Test
 

@@ -9,6 +9,7 @@ python3 -m py_compile tools/*.py
 
 echo "smoke: unit tests"
 python3 tools/test_formal.py
+python3 tools/test_gui.py
 python3 tools/test_sva_lower.py
 python3 tools/test_sva_sby.py
 
