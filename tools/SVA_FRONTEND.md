@@ -18,6 +18,7 @@ support in the current OSS CAD `yosys-slang` + `sby` flow.
 - depth-bounded nonconsecutive repetition consequents such as `A |-> B[=N] ##K C`
 - event functions in terms such as `$rose(a)`, `$fell(b)`, `$stable(c)`, and `$changed(d)`
 - optional `disable iff (expr)`
+- exact-delay `throughout` forms such as `HOLD throughout (A ##2 B)`
 - `assert property (NAME);`
 - `assume property (NAME);`
 - `cover property (NAME);`
@@ -121,6 +122,7 @@ path currently does not handle:
 - general ranged-delay and repetition forms beyond the simple subset above
 - exact unbounded lowering for goto repetition `[->]` and nonconsecutive
   repetition `[=]`
+- `throughout` beyond the current exact-delay rhs subset
 - multi-clock properties
 - multicycle bare `assert property` without an implication wrapper
 - lowering multiple-module files in one pass
@@ -143,8 +145,8 @@ python3 tools/test_sva_lower.py
 
 The local lowering path has been cross-checked against `ebmc` on the supported
 subset across `assert`, `assume`, `cover`, `|->`, `|=>`, fixed `##N`, named
-sequences, and `disable iff`. The two remaining EBMC-only forms in that check
-are:
+sequences, `disable iff`, and the exact-delay `throughout` subset. Remaining
+EBMC-only forms in that check include:
 
-- inline anonymous properties such as `assert property (@(...))`
+- `throughout` outside the current exact-delay rhs subset
 - multicycle bare `assert property` without an implication wrapper

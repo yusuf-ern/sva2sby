@@ -11,6 +11,7 @@ from sva_sby import (
     build_ebmc_task_configs,
     normalize_ebmc_text,
     prepare_sby,
+    sby_requires_ebmc,
     source_requires_ebmc,
 )
 
@@ -45,6 +46,14 @@ endmodule
             source_requires_ebmc(
                 """module top(input logic clk, input logic a);
 assert property (@(posedge clk) $rose(a) |=> a);
+endmodule
+"""
+            )
+        )
+        self.assertFalse(
+            source_requires_ebmc(
+                """module top(input logic clk, input logic start, input logic hold, input logic b, input logic c);
+assert property (@(posedge clk) start |-> hold throughout (b ##2 c));
 endmodule
 """
             )
@@ -181,6 +190,82 @@ demo.sv
             lowered_text = (workdir / "files" / "demo.sv").read_text()
             self.assertIn("// sva_lower: lowered assert property (anon_0)", lowered_text)
             self.assertIn("if ((a)) assert ((b));", lowered_text)
+
+    def test_prepare_sby_lowers_supported_throughout_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            sv_path = source_dir / "demo.sv"
+            sv_path.write_text(
+                """module demo(input logic clk, input logic start, input logic hold, input logic b, input logic c);
+property p;
+    @(posedge clk) start |-> hold throughout (b ##2 c);
+endproperty
+assert property (p);
+endmodule
+"""
+            )
+
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv demo.sv
+prep -top demo
+
+[files]
+demo.sv
+"""
+            )
+
+            prepare_sby(sby_path, workdir)
+            lowered_text = (workdir / "files" / "demo.sv").read_text()
+            self.assertNotIn("throughout", lowered_text)
+            self.assertIn("hold && b", lowered_text)
+            self.assertIn("$past((hold))", lowered_text)
+            self.assertIn("hold && c", lowered_text)
+
+    def test_sby_requires_ebmc_is_false_for_supported_throughout_sby(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            (source_dir / "demo.sv").write_text(
+                """module demo(input logic clk, input logic start, input logic hold, input logic b, input logic c);
+property p;
+    @(posedge clk) start |-> hold throughout (b ##2 c);
+endproperty
+assert property (p);
+endmodule
+"""
+            )
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -sv demo.sv
+prep -top demo
+
+[files]
+demo.sv
+"""
+            )
+            self.assertFalse(sby_requires_ebmc(sby_path))
 
     def test_prepare_sby_supports_tasks_aliases_and_inline_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -464,7 +549,7 @@ demo.sv
             self.assertEqual(len(configs), 1)
             self.assertEqual(configs[0].depth, 20)
 
-    def test_prepare_sby_leaves_labeled_property_files_unchanged(self) -> None:
+    def test_prepare_sby_lowers_labeled_property_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source_dir = root / "src"
@@ -500,7 +585,10 @@ labeled.sv
 
             prepare_sby(sby_path, workdir)
             staged = workdir / "files" / "labeled.sv"
-            self.assertEqual(staged.read_text(), original_text)
+            staged_text = staged.read_text()
+            self.assertIn("// sva_lower: removed property p", staged_text)
+            self.assertIn("// sva_lower: lowered assert property (p)", staged_text)
+            self.assertNotIn("foo: assert property (p);", staged_text)
 
     def test_prepare_sby_can_strip_read_verific(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -709,6 +797,198 @@ props.sv
             self.assertIn(".a(a)", staged_demo)
             self.assertIn(".b(b)", staged_demo)
             self.assertIn("// sva_sby: removed bind demo demo_props demo_props_i", staged_props)
+
+    def test_prepare_sby_rewrites_bind_when_checker_uses_labeled_assertions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            (source_dir / "demo.sv").write_text(
+                """module demo(input logic clk, input logic rst_n, input logic a, input logic b);
+endmodule
+"""
+            )
+            (source_dir / "props.sv").write_text(
+                """module demo_props(input logic clk, input logic rst_n, input logic a, input logic b);
+default clocking @(posedge clk); endclocking
+default disable iff (!rst_n);
+safe_check: assert property (a |-> b);
+endmodule
+
+bind demo demo_props demo_props_i (.*);
+"""
+            )
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc
+
+[script]
+read -sv demo.sv
+read -sv props.sv
+prep -top demo
+
+[files]
+demo.sv
+props.sv
+"""
+            )
+
+            prepare_sby(sby_path, workdir)
+
+            staged_demo = (workdir / "files" / "demo.sv").read_text()
+            staged_props = (workdir / "files" / "props.sv").read_text()
+            self.assertIn("demo_props demo_props_i", staged_demo)
+            self.assertIn("// sva_lower: lowered assert property (anon_0)", staged_props)
+            self.assertNotIn("safe_check: assert property", staged_props)
+            self.assertIn("// sva_sby: removed bind demo demo_props demo_props_i", staged_props)
+
+    def test_prepare_sby_rewrites_bind_when_checker_uses_parameterized_property(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            (source_dir / "demo.sv").write_text(
+                """module demo(input logic clk, input logic rst_n, input logic a, input logic b);
+endmodule
+"""
+            )
+            (source_dir / "props.sv").write_text(
+                """module demo_props(input logic clk, input logic rst_n, input logic a, input logic b);
+default clocking @(posedge clk); endclocking
+default disable iff (!rst_n);
+property signal_seq(first, second);
+    (first && !second) ##[+] (!first && second);
+endproperty
+pair_ab: cover property (signal_seq(a, b));
+endmodule
+
+bind demo demo_props demo_props_i (.*);
+"""
+            )
+            sby_path = source_dir / "demo.sby"
+            sby_path.write_text(
+                """[options]
+mode cover
+depth 6
+
+[engines]
+smtbmc
+
+[script]
+read -sv demo.sv
+read -sv props.sv
+prep -top demo
+
+[files]
+demo.sv
+props.sv
+"""
+            )
+
+            prepare_sby(sby_path, workdir)
+
+            staged_demo = (workdir / "files" / "demo.sv").read_text()
+            staged_props = (workdir / "files" / "props.sv").read_text()
+            self.assertIn("demo_props demo_props_i", staged_demo)
+            self.assertIn("// sva_lower: removed property signal_seq", staged_props)
+            self.assertIn("// sva_lower: lowered cover property (pair_ab)", staged_props)
+            self.assertIn("reg __sva_cover_pair_ab_stage;", staged_props)
+            self.assertNotIn("pair_ab: cover property (signal_seq(a, b));", staged_props)
+            self.assertIn("// sva_sby: removed bind demo demo_props demo_props_i", staged_props)
+
+    def test_prepare_sby_rewrites_multi_module_checker_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            workdir = root / "work"
+
+            (source_dir / "intersection.sv").write_text(
+                """module intersection(
+    input logic clk,
+    input logic rst_n,
+    input logic pedestrian_button,
+    input logic pedestrian_green
+);
+endmodule
+"""
+            )
+            (source_dir / "trafficlight.sv").write_text(
+                """module trafficlight(
+    input logic clk,
+    input logic rst_n,
+    input logic state_ok
+);
+endmodule
+"""
+            )
+            (source_dir / "checkers.sv").write_text(
+                """module liveness(
+    input logic clk,
+    input logic rst_n,
+    input logic pedestrian_button,
+    input logic pedestrian_green
+);
+default clocking @(posedge clk); endclocking
+default disable iff (!rst_n);
+liveness_pedestrian: assert property (pedestrian_button |-> ##[0:2] pedestrian_green);
+endmodule
+
+module trafficlight_invariants(
+    input logic clk,
+    input logic rst_n,
+    input logic state_ok
+);
+default clocking @(posedge clk); endclocking
+default disable iff (!rst_n);
+state_valid: assert property (state_ok);
+endmodule
+
+bind intersection liveness checker_inst (.*);
+bind trafficlight trafficlight_invariants invariants_inst (.*);
+"""
+            )
+            sby_path = source_dir / "multi_bind.sby"
+            sby_path.write_text(
+                """[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc
+
+[script]
+read -sv intersection.sv
+read -sv trafficlight.sv
+read -sv checkers.sv
+prep -top intersection
+
+[files]
+intersection.sv
+trafficlight.sv
+checkers.sv
+"""
+            )
+
+            prepare_sby(sby_path, workdir)
+
+            staged_intersection = (workdir / "files" / "intersection.sv").read_text()
+            staged_trafficlight = (workdir / "files" / "trafficlight.sv").read_text()
+            staged_checkers = (workdir / "files" / "checkers.sv").read_text()
+            self.assertIn("liveness checker_inst", staged_intersection)
+            self.assertIn("trafficlight_invariants invariants_inst", staged_trafficlight)
+            self.assertEqual(staged_checkers.count("// sva_lower: lowered assert property (anon_0)"), 2)
+            self.assertIn("// sva_sby: removed bind intersection liveness checker_inst", staged_checkers)
+            self.assertIn("// sva_sby: removed bind trafficlight trafficlight_invariants invariants_inst", staged_checkers)
 
     def test_prepare_sby_preserves_unresolved_bind_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

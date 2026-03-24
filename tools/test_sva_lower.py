@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from sva_lower import lower_text
+from sva_lower import FixedSequence, lower_text, parse_sequence_expr
 
 
 class SvaLowerTests(unittest.TestCase):
@@ -63,7 +63,7 @@ endmodule
         lowered = lower_text(source)
         self.assertIn("if (1'b1) assert ((a));", lowered)
 
-    def test_multicycle_bare_assert_is_rejected(self) -> None:
+    def test_multicycle_bare_assert_is_lowered(self) -> None:
         source = """
 module top(input logic clk, input logic a, input logic b);
 property p_bad;
@@ -72,8 +72,24 @@ endproperty
 assert property (p_bad);
 endmodule
 """
-        with self.assertRaisesRegex(ValueError, "multi-cycle bare sequence"):
-            lower_text(source)
+        lowered = lower_text(source)
+        self.assertIn("// sva_lower: lowered assert property (p_bad)", lowered)
+        self.assertIn("if (__sva_assert_p_bad_past_valid) assert", lowered)
+        self.assertIn("$past((a))", lowered)
+
+    def test_bare_ranged_delay_assert_is_lowered(self) -> None:
+        source = """
+module top(input logic clk, input logic b);
+property p_range;
+    @(posedge clk) ##[1:3] b;
+endproperty
+assert property (p_range);
+endmodule
+"""
+        lowered = lower_text(source)
+        self.assertIn("// sva_lower: lowered assert property (p_range)", lowered)
+        self.assertIn("reg [2:0] __sva_assert_p_range_pending;", lowered)
+        self.assertIn("if (__sva_assert_p_range_pending[2]) assert (b);", lowered)
 
     def test_delayed_implication_without_disable_initializes_history(self) -> None:
         source = """
@@ -154,6 +170,61 @@ endmodule
         self.assertIn("// sva_lower: lowered assert property (anon_0)", lowered)
         self.assertIn("always @(posedge clk) begin", lowered)
         self.assertIn("if ((a)) assert ((b));", lowered)
+
+    def test_lowers_labeled_inline_property(self) -> None:
+        source = """
+module top(input logic clk, input logic rst_n, input logic a, input logic b);
+default clocking @(posedge clk); endclocking
+default disable iff (!rst_n);
+safe_check: assert property (a |-> b);
+endmodule
+"""
+        lowered = lower_text(source)
+        self.assertIn("// sva_lower: lowered assert property (anon_0)", lowered)
+        self.assertIn("if ((a)) assert ((b));", lowered)
+        self.assertNotIn("safe_check: assert property", lowered)
+
+    def test_lowers_parameterized_property_call(self) -> None:
+        source = """
+module top(input logic clk, input logic rst_n, input logic a, input logic b);
+default clocking @(posedge clk); endclocking
+default disable iff (!rst_n);
+property signal_seq(first, second);
+    (first && !second) ##[+] (!first && second);
+endproperty
+pair_ab: cover property (signal_seq(a, b));
+endmodule
+"""
+        lowered = lower_text(source)
+        self.assertIn("// sva_lower: removed property signal_seq", lowered)
+        self.assertIn("// sva_lower: lowered cover property (pair_ab)", lowered)
+        self.assertIn("reg __sva_cover_pair_ab_stage;", lowered)
+        self.assertNotIn("pair_ab: cover property (signal_seq(a, b));", lowered)
+
+    def test_parses_throughout_into_guarded_fixed_sequence(self) -> None:
+        sequence = parse_sequence_expr("hold throughout (b ##2 c)", {})
+        self.assertIsInstance(sequence, FixedSequence)
+        self.assertEqual(sequence.terms, ["(hold && b)", "hold", "(hold && c)"])
+        self.assertEqual(sequence.delays, [1, 1])
+
+    def test_rejects_throughout_with_ranged_delay(self) -> None:
+        with self.assertRaisesRegex(ValueError, "throughout with ranged delays"):
+            parse_sequence_expr("hold throughout (b ##[1:2] c)", {})
+
+    def test_lowers_implication_with_throughout_fixed_delay(self) -> None:
+        source = """
+module top(input logic clk, input logic start, input logic hold, input logic b, input logic c);
+property p;
+    @(posedge clk) start |-> hold throughout (b ##2 c);
+endproperty
+assert property (p);
+endmodule
+"""
+        lowered = lower_text(source)
+        self.assertIn("// sva_lower: lowered assert property (p)", lowered)
+        self.assertIn("hold && b", lowered)
+        self.assertIn("$past((hold))", lowered)
+        self.assertIn("hold && c", lowered)
 
     def test_lowers_implication_with_leading_delay_in_consequent(self) -> None:
         source = """

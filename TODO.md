@@ -20,6 +20,7 @@ The remaining backlog is below.
 ## Lowering Work
 
 - exact unbounded automata for `[->]` and `[=]`
+- broader `throughout` coverage for ranged-delay rhs sequences and richer composition
 - broader composed-property coverage beyond the current bounded subset
 - support for bare multicycle `assert property` sequence forms
 - multi-clock property support

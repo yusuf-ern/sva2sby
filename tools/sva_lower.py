@@ -36,7 +36,7 @@ SEQUENCE_RE = re.compile(
 )
 
 PROPERTY_RE = re.compile(
-    r"property\s+(?P<name>\w+)\s*;\s*(?P<body>.*?)\s*endproperty\s*",
+    r"property\s+(?P<name>\w+)\s*(?:\((?P<formals>.*?)\))?\s*;\s*(?P<body>.*?)\s*endproperty\s*",
     re.DOTALL,
 )
 
@@ -68,6 +68,7 @@ DEFAULT_DISABLE_RE = re.compile(
 ACTION_LINE_RE = re.compile(
     r"""
     ^(?P<indent>\s*)
+    (?:(?P<label>\w+)\s*:\s*)?
     (?P<kind>assert|assume|cover|`\w+)
     \s+property\s*\(\s*(?P<body>.*)\s*\)\s*;
     \s*$
@@ -78,6 +79,7 @@ ACTION_LINE_RE = re.compile(
 ACTION_STATEMENT_RE = re.compile(
     r"""
     ^(?P<indent>[ 	]*)
+    (?:(?P<label>\w+)\s*:\s*)?
     (?P<kind>assert|assume|cover|`\w+)
     \s+property\s*\(\s*(?P<body>.*?)\s*\)\s*;
     [ 	]*$
@@ -158,6 +160,13 @@ class PropertyDef:
     antecedent: FixedSequence | PatternSequence | None = None
     consequent: FixedSequence | PatternSequence | UntilSequence | None = None
     op: str | None = None
+
+
+@dataclass
+class PropertyTemplate:
+    name: str
+    formals: list[str]
+    body: str
 
 
 @dataclass
@@ -358,6 +367,75 @@ def find_matching_paren(text: str, open_index: int) -> int:
             if depth == 0:
                 return index
     raise ValueError(f"Unbalanced parentheses in expression '{text.strip()}'")
+
+
+def split_argument_list(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    parts = [part.strip() for part in split_top_level(stripped, ",")]
+    if any(not part for part in parts):
+        raise ValueError(f"Malformed argument list '{text.strip()}'")
+    return parts
+
+
+def formal_arg_name(text: str) -> str:
+    identifiers = re.findall(r"\b[A-Za-z_]\w*\b", text)
+    if not identifiers:
+        raise ValueError(f"Unsupported property formal '{text.strip()}'")
+    return identifiers[-1]
+
+
+def parse_property_formals(text: str) -> list[str]:
+    formals = [formal_arg_name(part) for part in split_argument_list(text)]
+    if len(set(formals)) != len(formals):
+        raise ValueError(f"Duplicate property formals in '{text.strip()}'")
+    return formals
+
+
+def parse_property_call(text: str) -> tuple[str, list[str]] | None:
+    stripped = text.strip()
+    match = re.match(r"^(?P<name>\w+)\s*\(", stripped)
+    if match is None:
+        return None
+    open_index = stripped.find("(", len(match.group("name")))
+    close_index = find_matching_paren(stripped, open_index)
+    if stripped[close_index + 1 :].strip():
+        return None
+    return match.group("name"), split_argument_list(stripped[open_index + 1 : close_index])
+
+
+def substitute_formals(text: str, mapping: dict[str, str]) -> str:
+    expanded = text
+    for formal in sorted(mapping, key=len, reverse=True):
+        expanded = re.sub(
+            rf"\b{re.escape(formal)}\b",
+            f"({mapping[formal].strip()})",
+            expanded,
+        )
+    return expanded
+
+
+def instantiate_property_template(
+    template: PropertyTemplate,
+    actuals: list[str],
+    instance_name: str,
+    sequence_defs: dict[str, str],
+    default_clock: str | None = None,
+    default_disable: str | None = None,
+) -> PropertyDef:
+    if len(actuals) != len(template.formals):
+        raise ValueError(
+            f"Property '{template.name}' expects {len(template.formals)} arguments, got {len(actuals)}"
+        )
+    mapping = dict(zip(template.formals, actuals))
+    return parse_property(
+        instance_name,
+        substitute_formals(template.body, mapping),
+        sequence_defs,
+        default_clock,
+        default_disable,
+    )
 
 
 def normalize_event_function(name: str, argument: str) -> str:
@@ -561,6 +639,107 @@ def find_implication(expr: str) -> tuple[str, str, str] | None:
     return None
 
 
+def find_top_level_keyword(expr: str, keyword: str) -> tuple[str, str] | None:
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    index = 0
+    keyword_len = len(keyword)
+    while index < len(expr):
+        char = expr[index]
+        if char == "(":
+            depth_paren += 1
+        elif char == ")":
+            depth_paren -= 1
+        elif char == "{":
+            depth_brace += 1
+        elif char == "}":
+            depth_brace -= 1
+        elif char == "[":
+            depth_bracket += 1
+        elif char == "]":
+            depth_bracket -= 1
+
+        if (
+            depth_paren == 0
+            and depth_brace == 0
+            and depth_bracket == 0
+            and expr.startswith(keyword, index)
+        ):
+            before_ok = index == 0 or expr[index - 1].isspace()
+            after_index = index + keyword_len
+            after_ok = after_index == len(expr) or expr[after_index].isspace()
+            if before_ok and after_ok:
+                return expr[:index], expr[after_index:]
+        index += 1
+    return None
+
+
+def pattern_from_sequence(
+    sequence: FixedSequence | PatternSequence,
+) -> PatternSequence:
+    if isinstance(sequence, PatternSequence):
+        return sequence
+    return PatternSequence(
+        [TermToken(expr=term) for term in sequence.terms],
+        [DelayRange(delay, delay) for delay in sequence.delays],
+    )
+
+
+def throughout_guard_expr(
+    expr: str,
+    sequence_defs: dict[str, str],
+    active: tuple[str, ...] = (),
+) -> str:
+    guard = parse_sequence_expr(expr, sequence_defs, active)
+    if isinstance(guard, (UntilSequence, EventualChainSequence)):
+        raise ValueError("throughout guard must be a single-cycle term")
+    pattern = pattern_from_sequence(guard)
+    if len(pattern.terms) != 1 or pattern.delays:
+        raise ValueError("throughout guard must be a single-cycle term")
+    term = pattern.terms[0]
+    if term.repeat_kind != "consecutive" or term.repeat_min != 1 or term.repeat_max != 1:
+        raise ValueError("throughout guard must be a single-cycle term")
+    return term.expr
+
+
+def apply_throughout_guard(
+    guard_expr: str,
+    sequence: FixedSequence | PatternSequence,
+) -> FixedSequence | PatternSequence:
+    pattern = pattern_from_sequence(sequence)
+    if not pattern.terms:
+        raise ValueError("throughout requires a non-empty rhs sequence")
+
+    def guarded_token(token: TermToken) -> TermToken:
+        return TermToken(
+            expr=conjunction_expr([guard_expr, token.expr]),
+            repeat_min=token.repeat_min,
+            repeat_max=token.repeat_max,
+            repeat_kind=token.repeat_kind,
+        )
+
+    guarded_terms: list[TermToken] = [guarded_token(pattern.terms[0])]
+    guarded_delays: list[DelayRange] = []
+
+    for delay, token in zip(pattern.delays, pattern.terms[1:]):
+        if delay.min != delay.max:
+            raise ValueError("throughout with ranged delays is unsupported")
+        if delay.min == 0:
+            guarded_delays.append(DelayRange(0, 0))
+        else:
+            for _ in range(delay.min - 1):
+                guarded_delays.append(DelayRange(1, 1))
+                guarded_terms.append(TermToken(expr=guard_expr))
+            guarded_delays.append(DelayRange(1, 1))
+        guarded_terms.append(guarded_token(token))
+
+    guarded_pattern = PatternSequence(guarded_terms, guarded_delays)
+    if is_exact_pattern(guarded_pattern):
+        return pattern_to_fixed(guarded_pattern)
+    return guarded_pattern
+
+
 def split_sequence_parts(expr: str) -> tuple[list[str], list[DelayRange]]:
     stripped = strip_trailing_semicolon(expr)
     terms: list[str] = []
@@ -713,6 +892,15 @@ def parse_sequence_expr(
         return EventualChainSequence(
             [normalize_event_functions(strip_wrapping_parens(part)) for part in plus_parts]
         )
+
+    throughout = find_top_level_keyword(stripped, "throughout")
+    if throughout is not None:
+        lhs, rhs = throughout
+        guard_expr = throughout_guard_expr(lhs.strip(), sequence_defs, active)
+        guarded_sequence = parse_sequence_expr(rhs.strip(), sequence_defs, active)
+        if isinstance(guarded_sequence, (UntilSequence, EventualChainSequence)):
+            raise ValueError("throughout rhs uses unsupported operators")
+        return apply_throughout_guard(guard_expr, guarded_sequence)
 
     hold_match = FIXED_HOLD_RE.fullmatch(stripped)
     if hold_match:
@@ -1914,9 +2102,39 @@ def emit_action(kind: str, prop: PropertyDef, bounded_eventual_depth: int | None
 
         seq_logic = add_sequence_logic(prop.sequence, "seq")
         if kind != "cover" and any(offset > 0 for offset in seq_logic.match_offsets):
-            raise ValueError(
-                f"{kind} property ({prop.name}) uses a multi-cycle bare sequence. "
-                "Wrap it in an implication property first."
+            implicit_prop = PropertyDef(
+                name=prop.name,
+                clock=prop.clock,
+                disable=prop.disable,
+                antecedent=FixedSequence(["1'b1"], []),
+                consequent=pattern_from_sequence(prop.sequence),
+                op="|->",
+            )
+            antecedent_logic = add_sequence_logic(implicit_prop.antecedent, "ant")
+            if pattern_requires_bounded_lowering(implicit_prop.consequent):
+                return emit_stateful_bounded_pattern_implication(
+                    kind,
+                    prefix,
+                    implicit_prop,
+                    antecedent_logic,
+                    implicit_prop.consequent,
+                    bounded_eventual_depth=bounded_eventual_depth,
+                )
+            if simple_ranged_delay(implicit_prop.consequent) is not None:
+                return emit_simple_ranged_delay_implication(
+                    kind,
+                    prefix,
+                    implicit_prop,
+                    antecedent_logic,
+                    implicit_prop.consequent,
+                )
+            return emit_pattern_implication(
+                kind,
+                prefix,
+                implicit_prop,
+                antecedent_logic,
+                implicit_prop.consequent,
+                bounded_eventual_depth=bounded_eventual_depth,
             )
         action_lines = [action_line(kind, "1'b1", seq_logic.match_expr)]
         return wrap_formal_block(
@@ -2015,6 +2233,7 @@ def lower_text(text: str, bounded_eventual_depth: int | None = None) -> str:
     text = mask_comments(text)
     sequence_defs: dict[str, str] = {}
     properties: dict[str, PropertyDef] = {}
+    property_templates: dict[str, PropertyTemplate] = {}
     default_clock: str | None = None
     default_disable: str | None = None
 
@@ -2045,7 +2264,15 @@ def lower_text(text: str, bounded_eventual_depth: int | None = None) -> str:
     def collect_property(match: re.Match[str]) -> str:
         name = match.group("name")
         body = match.group("body")
-        properties[name] = parse_property(name, body, sequence_defs, default_clock, default_disable)
+        formals = match.group("formals")
+        if formals is not None:
+            property_templates[name] = PropertyTemplate(
+                name=name,
+                formals=parse_property_formals(formals),
+                body=body.strip(),
+            )
+        else:
+            properties[name] = parse_property(name, body, sequence_defs, default_clock, default_disable)
         return f"// sva_lower: removed property {name}\n"
 
     transformed = PROPERTY_RE.sub(collect_property, transformed)
@@ -2057,6 +2284,7 @@ def lower_text(text: str, bounded_eventual_depth: int | None = None) -> str:
     last_end = 0
     for match in ACTION_STATEMENT_RE.finditer(transformed):
         rewritten_parts.append(transformed[last_end:match.start()])
+        label = match.group("label")
         kind = match.group("kind")
         body = match.group("body").strip()
         comment_name = body
@@ -2065,16 +2293,35 @@ def lower_text(text: str, bounded_eventual_depth: int | None = None) -> str:
                 prop = properties[body]
                 comment_name = body
             else:
-                anon_name = f"anon_{action_index}"
-                action_index += 1
-                prop = parse_property(
-                    anon_name,
-                    body,
-                    sequence_defs,
-                    default_clock,
-                    default_disable,
-                )
-                comment_name = anon_name
+                call = parse_property_call(body)
+                if call is not None and call[0] in property_templates:
+                    template = property_templates[call[0]]
+                    if label:
+                        instance_name = sanitize_identifier(label)
+                        comment_name = label
+                    else:
+                        instance_name = f"anon_{action_index}"
+                        action_index += 1
+                        comment_name = template.name
+                    prop = instantiate_property_template(
+                        template,
+                        call[1],
+                        instance_name,
+                        sequence_defs,
+                        default_clock,
+                        default_disable,
+                    )
+                else:
+                    anon_name = f"anon_{action_index}"
+                    action_index += 1
+                    prop = parse_property(
+                        anon_name,
+                        body,
+                        sequence_defs,
+                        default_clock,
+                        default_disable,
+                    )
+                    comment_name = anon_name
             emitted_blocks.append(
                 emit_action(
                     kind,

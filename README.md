@@ -75,6 +75,7 @@ The local lowering path currently covers a bounded subset including:
 | `assert property` / `assume property` / `cover property` | Supported | Named and anonymous forms, including multiline action statements |
 | `default clocking` | Supported | Single module-level default clocking in one-line or multiline form |
 | `disable iff` | Supported | Inline or single module-level default `disable iff` |
+| `throughout` | Supported | Single-cycle guard over an exact-delay rhs sequence on the pure `sby` path |
 | Existing `.sby` files | Supported | Wrapper stages and rewrites sources |
 | Optional `ebmc` backend | Supported | For operators outside the safe local subset |
 
@@ -256,6 +257,7 @@ Known limits include:
 - exact unbounded lowering for `[->]` and `[=]`
 - multi-clock properties
 - multiple default clocking / default disable declarations or scoped redefinition
+- `throughout` beyond the current exact-delay rhs subset
 - labeled concurrent action statements on the local lowering path
 - bare multicycle `assert property` without an implication wrapper
 - full multi-module lowering in one pass
@@ -272,7 +274,6 @@ outside the safe local lowering subset. The active backlog is also tracked in
 Priority SVA work:
 
 - `within`
-- `throughout`
 - `intersect`
 - `first_match`
 - `until` and `until_with`
@@ -282,6 +283,7 @@ Priority SVA work:
 Lowering and infrastructure work:
 
 - exact unbounded automata for `[->]` and `[=]`, instead of the current bounded encoding
+- broader `throughout` coverage for ranged-delay rhs sequences and more complex composition
 - labeled concurrent action statements and attributes before action statements
 - scoped or repeated `default clocking` / `default disable iff` handling
 - support for bare multicycle `assert property` sequence forms

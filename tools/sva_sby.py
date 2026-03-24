@@ -42,6 +42,7 @@ MUST_LOWER_RE = re.compile(
     |^\s*default\s+clocking\b
     |^\s*default\s+disable\s+iff\b
     |^\s*bind\b
+    |\bthroughout\b
     |\#\#\[\+\]
     |\[\s*\*\s*\]
     """,
@@ -58,7 +59,6 @@ BOUNDED_EVENTUAL_RE = re.compile(r"\[\s*(?:->|=)\s*\d")
 EBMC_REQUIRED_RE = re.compile(
     r"""
     \bwithin\b
-    |\bthroughout\b
     |\bintersect\b
     |\bfirst_match\b
     |\buntil_with\b
@@ -89,6 +89,7 @@ MODULE_HEADER_RE = re.compile(
     r"module\s+(?P<name>\w+)\s*\((?P<ports>.*?)\)\s*;",
     re.DOTALL,
 )
+MODULE_END_RE = re.compile(r"^\s*endmodule\b.*(?:\r?\n|$)", re.MULTILINE)
 PORT_DECL_RE = re.compile(
     r"\b(?:input|output|inout)\b(?P<decl>.*?)(?=(?:\binput\b|\boutput\b|\binout\b)|\Z)",
     re.DOTALL,
@@ -329,7 +330,7 @@ def stage_source_path(
     staged_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.suffix in LOWERABLE_SUFFIXES and source_path.is_file():
         staged_path.write_text(
-            lower_or_keep_text(
+            lower_sv_text(
                 source_path.read_text(),
                 str(source_path),
                 bounded_eventual_depth=bounded_eventual_depth,
@@ -361,6 +362,63 @@ def parse_module_ports(text: str) -> dict[str, list[str]]:
                 ports.append(port_match.group("name"))
         modules[match.group("name")] = ports
     return modules
+
+
+@dataclass(frozen=True)
+class ModuleBlock:
+    name: str
+    start: int
+    endmodule_start: int
+    end: int
+
+
+def find_module_blocks(text: str) -> list[ModuleBlock]:
+    blocks: list[ModuleBlock] = []
+    search_from = 0
+    while True:
+        header = MODULE_HEADER_RE.search(text, search_from)
+        if header is None:
+            break
+        end_match = MODULE_END_RE.search(text, header.end())
+        if end_match is None:
+            raise ValueError("sva_sby: failed to find matching endmodule")
+        blocks.append(
+            ModuleBlock(
+                name=header.group("name"),
+                start=header.start(),
+                endmodule_start=end_match.start(),
+                end=end_match.end(),
+            )
+        )
+        search_from = end_match.end()
+    return blocks
+
+
+def lower_sv_text(text: str, origin: str, bounded_eventual_depth: int | None = None) -> str:
+    if not SVA_HINT_RE.search(text):
+        return text
+
+    blocks = find_module_blocks(text)
+    if len(blocks) <= 1:
+        return lower_or_keep_text(text, origin, bounded_eventual_depth=bounded_eventual_depth)
+
+    rewritten_parts: list[str] = []
+    last_end = 0
+    changed = False
+    for block in blocks:
+        rewritten_parts.append(text[last_end:block.start])
+        block_text = text[block.start:block.end]
+        lowered_block = lower_or_keep_text(
+            block_text,
+            f"{origin}:{block.name}",
+            bounded_eventual_depth=bounded_eventual_depth,
+        )
+        if lowered_block != block_text:
+            changed = True
+        rewritten_parts.append(lowered_block)
+        last_end = block.end
+    rewritten_parts.append(text[last_end:])
+    return "".join(rewritten_parts) if changed else text
 
 
 def applicable_body(line: str, task: str) -> str | None:
@@ -469,13 +527,13 @@ def make_instance(bound_module: str, instance_name: str, ports: list[str]) -> st
     return f"\t{bound_module} {instance_name} (\n{connections}\n\t);\n"
 
 
-def inject_formal_instances(text: str, instances: list[str]) -> str:
-    endmodule_match = list(re.finditer(r"^\s*endmodule\b", text, re.MULTILINE))
-    if len(endmodule_match) != 1:
-        raise ValueError("sva_sby: expected exactly one module when applying bind lowering")
-    insert_at = endmodule_match[0].start()
-    block = "\n`ifdef FORMAL\n" + "\n".join(instances) + "`endif\n"
-    return text[:insert_at] + block + text[insert_at:]
+def inject_formal_instances(text: str, target_module: str, instances: list[str]) -> str:
+    for block in find_module_blocks(text):
+        if block.name != target_module:
+            continue
+        formal_block = "\n`ifdef FORMAL\n" + "\n".join(instances) + "`endif\n"
+        return text[:block.endmodule_start] + formal_block + text[block.endmodule_start:]
+    raise ValueError(f"sva_sby: target module '{target_module}' not found for bind lowering")
 
 
 def prepare_sv_source(
@@ -483,7 +541,7 @@ def prepare_sv_source(
     origin: str,
     bounded_eventual_depth: int | None,
 ) -> PreparedSv:
-    lowered = lower_or_keep_text(text, origin, bounded_eventual_depth=bounded_eventual_depth)
+    lowered = lower_sv_text(text, origin, bounded_eventual_depth=bounded_eventual_depth)
     stripped, binds = strip_bind_lines(lowered)
     return PreparedSv(
         staged_rel=Path(),
@@ -821,7 +879,7 @@ def prepare_sby(
         source_section_seen = True
         if Path(section.args).suffix not in LOWERABLE_SUFFIXES:
             continue
-        lowered_text = lower_or_keep_text(
+        lowered_text = lower_sv_text(
             "".join(section.body),
             section.args,
             bounded_eventual_depth=bounded_eventual_depth,
@@ -838,7 +896,7 @@ def prepare_sby(
 
     module_to_dest: dict[str, str] = {}
     module_to_ports: dict[str, list[str]] = {}
-    bind_injections: dict[str, list[str]] = {}
+    bind_injections: dict[str, dict[str, list[str]]] = {}
     pending_binds: list[BindSpec] = []
     passthrough_bind_sources: set[str] = set()
 
@@ -865,15 +923,20 @@ def prepare_sby(
             passthrough_bind_sources.add(bind.source_dest)
             continue
         target_dest = module_to_dest[bind.target_module]
-        bind_injections.setdefault(target_dest, []).append(
+        bind_injections.setdefault(target_dest, {}).setdefault(bind.target_module, []).append(
             make_instance(bind.bound_module, bind.instance_name, module_to_ports[bind.bound_module])
         )
 
     for dest_entry in passthrough_bind_sources:
         prepared_sv[dest_entry].text = prepared_sv[dest_entry].original_text
 
-    for dest_entry, instances in bind_injections.items():
-        prepared_sv[dest_entry].text = inject_formal_instances(prepared_sv[dest_entry].text, instances)
+    for dest_entry, module_instances in bind_injections.items():
+        for target_module, instances in module_instances.items():
+            prepared_sv[dest_entry].text = inject_formal_instances(
+                prepared_sv[dest_entry].text,
+                target_module,
+                instances,
+            )
 
     for prepared in prepared_sv.values():
         if "`ifdef FORMAL" in prepared.text:
